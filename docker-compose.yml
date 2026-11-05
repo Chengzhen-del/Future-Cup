@@ -1,0 +1,14 @@
+services:
+  cloud:
+    build: .
+    container_name: inspectagent-cloud
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: prod
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+    volumes:
+      - ./data:/app/data
+      - ./knowledge:/app/knowledge
+    restart: unless-stopped

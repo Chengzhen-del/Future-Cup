@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智巡 InspectAgent · Web 测试台</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<header>
+  <div>
+    <strong>智巡 InspectAgent</strong>
+    <span class="sub">云端 Agent 测试台 · WebSocket 流式</span>
+  </div>
+  <div id="health">检测中…</div>
+</header>
+
+<main>
+  <section id="left" class="card">
+    <h2><span class="dot"></span>巡检输入</h2>
+
+    <div class="field">
+      <label>服务地址</label>
+      <input type="text" id="baseUrl" value="http://localhost:8000">
+    </div>
+
+    <div class="field">
+      <label>设备类型</label>
+      <select id="deviceType">
+        <option>低压配电柜</option>
+        <option>高压柜</option>
+        <option>干式变压器</option>
+        <option>直流屏</option>
+        <option>电缆沟</option>
+        <option>消防器材</option>
+      </select>
+    </div>
+
+    <div class="row2">
+      <div class="field">
+        <label>设备名</label>
+        <input type="text" id="deviceName" value="3号低压配电柜">
+      </div>
+      <div class="field">
+        <label>位置</label>
+        <input type="text" id="location" value="A区配电房">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>巡检员</label>
+      <input type="text" id="operator" value="运维员A">
+    </div>
+
+    <div class="field">
+      <label>语音描述（现场观察）</label>
+      <textarea id="voiceText" placeholder="例：接头有点烫，闻到轻微焦味，指示灯看起来都正常"></textarea>
+    </div>
+
+    <div class="field">
+      <label>现场照片（可选）</label>
+      <div class="thumb-wrap" id="thumb">
+        📷 点击上传图片
+        <input type="file" id="fileInput" accept="image/*" hidden>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>视觉模式</label>
+      <div class="seg" id="modeSeg">
+        <button data-mode="quick" class="active">⚡ 快速</button>
+        <button data-mode="detailed">🔍 详细</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>传感器（模拟值）</label>
+      <div class="row2">
+        <input type="number" id="temp" placeholder="温度 ℃" value="78.5">
+        <input type="number" id="hum" placeholder="湿度 %RH" value="62">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>传输方式</label>
+      <div class="seg" id="transSeg">
+        <button data-trans="stream" class="active">💬 WebSocket 流式（推荐）</button>
+        <button data-trans="batch">📦 HTTP 一次性（等 50 秒出结果）</button>
+      </div>
+    </div>
+
+    <button class="btn btn-primary" id="startBtn">🚀 开始巡检</button>
+    <button class="btn btn-danger hidden" id="cancelBtn">✋ 停止</button>
+  </section>
+
+  <section id="right" class="card">
+    <div id="right-top">
+      <h2 class="section-title-inline"><span class="dot"></span>Agent 对话流</h2>
+      <span class="conn-info" id="connInfo">待连接</span>
+    </div>
+    <div id="chat"></div>
+  </section>
+</main>
+
+</body>
+</html>
