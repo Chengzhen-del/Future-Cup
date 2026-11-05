@@ -11,14 +11,14 @@
 
 ## 0. 接口总表
 
-共 **37** 个端点（含静态资源与 WS）。
+共 **39** 个端点（含静态资源与 WS）。
 
 | # | 方法 | 路径 | 用途 | 端侧调用 |
 |---|---|---|---|---|
 | 1 | GET | `/` | 跳转 Web 测试台 | — |
 | 2 | GET | `/health` | 健康检查 / mock 判定 | 可选 |
 | 3 | GET | `/docs` | Swagger 交互文档 | — |
-| 4 | GET | `/media/{fileName}` | 现场图片访问 | 报告页 |
+| 4 | GET | `/media/{fileName}` | 现场图片/缩略图访问（**需 token**） | 报告页 |
 | 5 | GET | `/web/` | Web 测试台静态页 | — |
 | 6 | GET | `/api/v1/config` | 拉取阈值与开关 | 启动时 |
 | 7 | GET | `/api/v1/tasks` | 任务列表 | 任务页 |
@@ -52,6 +52,8 @@
 | 35 | GET | `/api/v1/device-types` | 设备类型 + 检查项模板 | 任务页 |
 | 36 | GET | `/api/v1/device-types/{deviceType}/checklist` | 单类型检查项模板 | 任务页 |
 | 37 | GET | `/api/v1/system/media-policy` | 媒体生命周期策略 | 运维 |
+| 38 | DELETE | `/api/v1/inspections/{id}` | 删除巡检（admin，连带删媒体） | 新增：历史页 |
+| 39 | GET | `/api/v1/inspections/{id}/report.pdf` | 导出巡检报告 PDF | 新增：报告页 |
 
 图例：**端侧调用**列中标注"新增"的，表示端侧 `HttpService.ets` 目前尚未封装。
 
@@ -471,22 +473,24 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 ### `GET /api/v1/system/media-policy`
 
 ```json
-{ "urlRule": "imageUrl 为 /media/{fileName}，imageAbsoluteUrl 为完整地址",
-  "retentionDays": 90, "urlExpiresDays": 90, "requiresAuth": false,
-  "keepFailedUploads": false, "thumbnailSupported": false, "pdfExportSupported": false,
-  "deleteWithInspection": false, "deleteApiSupported": false, "note": "..." }
+{ "urlRule": "imageUrl 为 /media/{fileName}；imageAbsoluteUrl 为完整地址（服务端已按当前 token 附加 ?token=，端侧 Image 可直接加载）",
+  "retentionDays": 90, "urlExpiresDays": 90, "requiresAuth": true,
+  "keepFailedUploads": false, "thumbnailSupported": true, "pdfExportSupported": true,
+  "deleteWithInspection": true, "deleteApiSupported": true, "note": "..." }
 ```
 
-媒体生命周期统一策略（已落地，不只是声明）：
+媒体生命周期统一策略（v8 起全部已落地，不只是声明）：
 
 | 问题 | 结论 |
 |---|---|
 | 原图/录音保留多久 | `MEDIA_RETENTION_DAYS`（默认 90 天） |
-| 谁来清理 | `DELETE /admin/archive` 调用 `cleanup_old_media()`，**只删已归档巡检的媒体**，主表仍在的图片不删 |
+| 谁来自动清理 | 服务内置定时任务，每 `CLEANUP_INTERVAL_HOURS`（默认 24）小时执行一次；也可手动 `DELETE /admin/archive` |
+| 清理范围 | **只删已归档巡检的媒体**，主表仍在的图片不删 |
 | 失败上传是否保留 | 不保留（落盘发生在巡检成功之后） |
-| 删除巡检是否删媒体 | 当前**没有删除巡检接口**，`deleteApiSupported=false` |
-| 缩略图 / PDF 导出 | 暂不支持 |
-| 图片鉴权与有效期 | `/media` 为静态资源，**不校验 token**（内网演示口径），超过保留期随文件清理而失效，不做签名 URL |
+| 删除巡检是否删媒体 | 是：`DELETE /inspections/{id}` 同时删原图、缩略图、findings，并写同步墓碑 |
+| 缩略图 | 支持：`imageThumbUrl` / `imageThumbAbsoluteUrl`（长边 480px JPEG） |
+| PDF 导出 | 支持：`GET /inspections/{id}/report.pdf`（A4，含判读明细与现场照片） |
+| 图片鉴权与有效期 | `/media` **校验 token**（`Authorization: Bearer` 或 `?token=`）；不做签名 URL，超过保留期随文件清理失效 |
 
 `imageUrl` 始终是相对路径（不变），跨网访问请读 `imageAbsoluteUrl`（绝对地址，
 基址优先取 `PUBLIC_BASE_URL` 环境变量，其次取请求来源）。
@@ -653,10 +657,54 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 |---|---|---|---|
 | 登录 / me / 刷新 / 登出 | ✅ | ✅ | ✅ |
 | 任务、设备、工单、巡检、Trace、Token 统计查询 | ✅ | ✅ | ✅ |
-| 改任务状态、上报巡检、工单流转、处理告警 | ✅ | ✅ | ✅ |
+| 改任务状态、上报巡检、工单流转、PDF 导出 | ✅ | ❌ 403 | ✅ |
+| 处理告警（`POST /alerts/{id}/resolve`） | ❌ 403 | ✅ | ✅ |
+| 删除巡检（`DELETE /inspections/{id}`） | ❌ 403 | ❌ 403 | ✅ |
 | 归档 / 清理（`/admin/archive`） | ❌ 403 | ❌ 403 | ✅ |
 
 - 角色来自 `users.role`，随 token 一起校验，**不信任前端传参**
 - 权限不足统一返回 `403 FORBIDDEN`（`{code,message,detail,traceId}`）
-- 当前默认账号只有 `admin` 与 `inspector`，`reviewer` 角色已支持校验，账号按需在 `users` 表添加
-- 验收命令：用 inspector token 调 `POST /api/v1/admin/archive` 应得到 403，用 admin token 得到 200
+- v8 默认账号：`admin/admin123`、`inspector/inspector123`、`reviewer/reviewer123`
+- 验收命令：inspector 调 `POST /admin/archive` 得 403；reviewer 调 `POST /alerts/{id}/resolve` 得 200
+
+---
+
+## 13. v8 变更（端侧清单收尾，2026-11）
+
+> 本次把端侧清单里此前"暂不做"的 7 项全部补齐。所有改动仍是**新增字段/新增接口**，老端侧不传参也能跑。
+
+### 13.1 新增接口
+
+| 接口 | 说明 |
+|---|---|
+| `DELETE /api/v1/inspections/{id}` | 删除巡检（admin）：连带删 findings / 原图 / 缩略图，并写 `deleted_records` 墓碑；返回 `{ok, deleted, mediaFiles}` |
+| `GET /api/v1/inspections/{id}/report.pdf` | 导出 A4 巡检报告（基本信息 + 结论 + 逐项判读 + 现场照片 + 执行步骤）；`application/pdf` |
+| `GET /media/{fileName}` | 由静态挂载改为**鉴权端点**：`Authorization: Bearer` 或 `?token=` 均可 |
+
+### 13.2 新增字段
+
+| DTO | 字段 | 说明 |
+|---|---|---|
+| `InspectResp` / `SyncInspection` | `imageThumbUrl` | 缩略图相对路径（长边 480px JPEG） |
+| 同上 | `imageThumbAbsoluteUrl` | 缩略图完整地址，**已自动附带当前 token**，可直接给 `Image` 组件 |
+| `SyncSnapshot.deleted` | `[{tableName,recordId,deviceId,deletedAt}]` | 删除墓碑；增量同步时按 `since` 下发，端侧据此删本地副本 |
+
+> `imageAbsoluteUrl` 同理：服务端会根据当前请求的 token 自动追加 `?token=`，
+> 端侧无需自己拼鉴权参数；若把 token 存入日志请自行脱敏。
+
+### 13.3 行为变更
+
+| 项 | 变更 | 端侧注意 |
+|---|---|---|
+| `/media` 鉴权 | `AUTH_ENABLED=1` 时无 token 返回 `401 UNAUTHORIZED` | 用接口返回的 `imageAbsoluteUrl` / `imageThumbAbsoluteUrl` 即可 |
+| Trace 时间戳 | 事件 `timestamp` 与 `createdAt` 精度升到**毫秒**（`...SSS`） | 老数据仍可能是秒级，解析请用宽松格式 |
+| 定时清理 | 服务内置后台任务，每 `CLEANUP_INTERVAL_HOURS` 小时清理记忆 / Trace / 已归档媒体 | 无需端侧参与 |
+| 图片删除 | 删除巡检会物理删除原图与缩略图 | 删除后旧 `imageAbsoluteUrl` 返回 404 |
+
+### 13.4 新增环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CLEANUP_INTERVAL_HOURS` | 24 | 定时清理间隔，`0` 关闭 |
+| `CLEANUP_DAYS_MEMORIES` | 180 | 历史记忆保留天数 |
+| `CLEANUP_DAYS_TRACES` | 30 | Trace 保留天数 |

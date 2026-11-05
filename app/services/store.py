@@ -55,6 +55,11 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _now_ms() -> str:
+    """v8：毫秒级时间戳（Trace 事件与 Trace 记录用，同轮事件可精确排序）。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 def paginate(items: list, page: int | None = None, page_size: int = 20):
     """P1-9 分页：不传 page 返回原列表（旧客户端零改动）；传了返回信封。"""
     if not page:
@@ -65,14 +70,52 @@ def paginate(items: list, page: int | None = None, page_size: int = 20):
             "total": len(items), "page": page, "pageSize": ps}
 
 
-def absolute_media_url(path: str, base_url: str = "") -> str:
-    """P1-10：把 /media/xxx 拼成完整可访问地址；已是 http 地址则原样返回。"""
+def absolute_media_url(path: str, base_url: str = "", token: str = "") -> str:
+    """P1-10：把 /media/xxx 拼成完整可访问地址；已是 http 地址则原样返回。
+
+    v8：/media 开启鉴权后，图片 URL 需带 token 才能直接加载（端侧 Image 组件
+    无法自定义 Header，因此由服务端在此自动附加 ?token=...）。
+    """
     if not path:
         return ""
     if path.startswith("http"):
         return path
     base = (base_url or settings.PUBLIC_BASE_URL or "").rstrip("/")
-    return (base + path) if base else ""
+    url = (base + path) if base else ""
+    if url and token and settings.AUTH_ENABLED:
+        url += ("&" if "?" in url else "?") + "token=" + token
+    return url
+
+
+def _thumb_name(image_file: str) -> str:
+    """原图文件名 -> 缩略图文件名（同一目录，_thumb 后缀）。"""
+    if not image_file:
+        return ""
+    stem, dot, _ext = image_file.rpartition(".")
+    return f"{stem}_thumb.{_ext or 'jpg'}" if dot else f"{image_file}_thumb.jpg"
+
+
+def make_thumbnail(image_file: str, thumb_file: str = "") -> bool:
+    """v8：生成报告列表用缩略图（长边 480px，JPEG q80）。
+
+    失败（图片损坏 / 未装 Pillow）返回 False，不影响主链路——原图照常可看。
+    """
+    thumb_file = thumb_file or _thumb_name(image_file)
+    src = settings.UPLOAD_DIR / image_file
+    dst = settings.UPLOAD_DIR / thumb_file
+    if not src.is_file():
+        return False
+    if dst.is_file():
+        return True
+    try:
+        from PIL import Image
+        with Image.open(src) as im:
+            im = im.convert("RGB")
+            im.thumbnail((480, 480))
+            im.save(dst, "JPEG", quality=80, optimize=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _create_all(c: sqlite3.Connection) -> None:
@@ -405,6 +448,35 @@ def init_db() -> None:
                       "createdAt,'') WHERE updatedAt=''")
             c.execute("INSERT INTO schema_version VALUES(7)")
 
+        # ---- v8: 缩略图 / 删除墓碑 / reviewer 账号 ----
+        if v < 8:
+            _ensure_column(c, "media", "thumbnailFile", "thumbnailFile TEXT DEFAULT ''")
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS deleted_records(
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tableName  TEXT,
+                    recordId   TEXT,
+                    deviceId   TEXT DEFAULT '',
+                    deletedAt  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_deleted_at ON deleted_records(deletedAt);
+            """)
+            # 为已存在的图片补生成缩略图（幂等：已存在同名文件则跳过）
+            rows = c.execute("SELECT fileName,thumbnailFile FROM media "
+                             "WHERE kind='image' AND fileName<>''").fetchall()
+            for r in rows:
+                thumb = r["thumbnailFile"] or _thumb_name(r["fileName"])
+                if thumb and make_thumbnail(r["fileName"], thumb):
+                    c.execute("UPDATE media SET thumbnailFile=? WHERE fileName=?",
+                              (thumb, r["fileName"]))
+            # reviewer 角色：只看/审 + 处理告警，不能上报巡检
+            if c.execute("SELECT COUNT(*) FROM users WHERE name='reviewer'").fetchone()[0] == 0:
+                c.execute("INSERT INTO users(id,name,role,team,phone,lastLoginAt,createdAt,passwordHash) "
+                          "VALUES(?,?,?,?,?,?,?,?)",
+                          ("U-0003", "reviewer", "reviewer", "安监部", "", "", _now(),
+                           _hash_password("reviewer123")))
+            c.execute("INSERT INTO schema_version VALUES(8)")
+
 
 def _ensure_column(c: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
     """幂等加列（迁移可重复执行，不会因列已存在而中断）。"""
@@ -638,9 +710,12 @@ def get_device_profile(device_id: str) -> DeviceProfile:
 
 
 # ---- 查询：巡检 ----
-def _inspection_brief(d: dict, base_url: str = "") -> SyncInspection:
+def _inspection_brief(d: dict, base_url: str = "", token: str = "") -> SyncInspection:
     """P1-6：同步/列表共用的固定摘要结构（不含 findings / steps）。"""
     image = f"/media/{d['imageId']}" if d.get("imageId") else ""
+    thumb_name = _thumb_name(d.get("imageId") or "")
+    thumb = (f"/media/{thumb_name}" if thumb_name
+             and (settings.UPLOAD_DIR / thumb_name).is_file() else "")
     return SyncInspection(
         inspectionId=d.get("id") or "",
         taskId=d.get("taskId") or "",
@@ -652,7 +727,9 @@ def _inspection_brief(d: dict, base_url: str = "") -> SyncInspection:
         confidence=float(d.get("confidence") or 0.0),
         advice=d.get("advice") or "",
         imageUrl=image,
-        imageAbsoluteUrl=absolute_media_url(image, base_url),
+        imageAbsoluteUrl=absolute_media_url(image, base_url, token),
+        imageThumbUrl=thumb,
+        imageThumbAbsoluteUrl=absolute_media_url(thumb, base_url, token),
         workOrderId=d.get("workOrderId") or "",
         capturedAt=d.get("capturedAt") or "",
         createdAt=d.get("createdAt") or "",
@@ -662,14 +739,19 @@ def _inspection_brief(d: dict, base_url: str = "") -> SyncInspection:
     )
 
 
-def inspection_to_resp(d: dict, base_url: str = "") -> InspectResp:
+def inspection_to_resp(d: dict, base_url: str = "", token: str = "") -> InspectResp:
     """P1-11：历史详情与 WS final 用同一个 InspectResp DTO。"""
     image = f"/media/{d['imageId']}" if d.get("imageId") else ""
+    thumb_name = _thumb_name(d.get("imageId") or "")
+    thumb = (f"/media/{thumb_name}" if thumb_name
+             and (settings.UPLOAD_DIR / thumb_name).is_file() else "")
     return InspectResp(
         sessionId=d.get("sessionId") or "",
         inspectionId=d.get("id") or "",
         imageUrl=image,
-        imageAbsoluteUrl=absolute_media_url(image, base_url),
+        imageAbsoluteUrl=absolute_media_url(image, base_url, token),
+        imageThumbUrl=thumb,
+        imageThumbAbsoluteUrl=absolute_media_url(thumb, base_url, token),
         level=d.get("level") or "正常",
         confidence=float(d.get("confidence") or 0.0),
         advice=d.get("advice") or "",
@@ -693,7 +775,7 @@ def inspection_to_resp(d: dict, base_url: str = "") -> InspectResp:
 
 def list_inspections(limit: int = 50, level: str = "", device_id: str = "",
                      start_time: str = "", end_time: str = "",
-                     base_url: str = "") -> list[SyncInspection]:
+                     base_url: str = "", token: str = "") -> list[SyncInspection]:
     sql = "SELECT * FROM inspections WHERE 1=1"
     args: list = []
     if level:
@@ -712,7 +794,7 @@ def list_inspections(limit: int = 50, level: str = "", device_id: str = "",
     args.append(limit)
     with _conn() as c:
         rows = c.execute(sql, args).fetchall()
-    return [_inspection_brief(dict(r), base_url) for r in rows]
+    return [_inspection_brief(dict(r), base_url, token) for r in rows]
 
 
 def get_inspection(inspection_id: str) -> dict | None:
@@ -800,14 +882,19 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
     iid = f"IN-{datetime.now():%Y%m%d}-{uuid.uuid4().hex[:4]}"
     now = _now()
     image_file = ""
+    thumb_file = ""
     if image_bytes:
         image_file = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}.jpg"
         (settings.UPLOAD_DIR / image_file).write_bytes(image_bytes)
+        # v8：同时生成缩略图（列表/报告页首屏用，原图仍保留）
+        thumb_file = _thumb_name(image_file)
+        if not make_thumbnail(image_file, thumb_file):
+            thumb_file = ""
         with _conn() as c:
-            c.execute("INSERT INTO media(id,inspectionId,kind,fileName,mimeType,sizeKb,createdAt) "
-                      "VALUES(?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO media(id,inspectionId,kind,fileName,mimeType,sizeKb,"
+                      "thumbnailFile,createdAt) VALUES(?,?,?,?,?,?,?,?)",
                       ("MD-" + uuid.uuid4().hex[:6], iid, "image", image_file,
-                       "image/jpeg", len(image_bytes) // 1024, _now()))
+                       "image/jpeg", len(image_bytes) // 1024, thumb_file, _now()))
 
     sensor_json = req.sensor.model_dump_json() if req.sensor else ""
     with _conn() as c:
@@ -832,8 +919,10 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
 
     resp.inspectionId = iid
     resp.imageUrl = f"/media/{image_file}" if image_file else ""
+    resp.imageThumbUrl = f"/media/{thumb_file}" if thumb_file else ""
     # 配了 PUBLIC_BASE_URL 时 WS final 也能直接拿到完整地址；否则由路由层按请求来源补
     resp.imageAbsoluteUrl = absolute_media_url(resp.imageUrl)
+    resp.imageThumbAbsoluteUrl = absolute_media_url(resp.imageThumbUrl)
     return resp
 
 # ============= P1-6/7: 端侧同步快照 + 冲突仲裁 =============
@@ -845,7 +934,8 @@ CONFLICT_ALLOWED: dict[str, set[str]] = {
 }
 
 
-def get_sync_snapshot(device_id: str = "", since: str = "", base_url: str = "") -> SyncSnapshot:
+def get_sync_snapshot(device_id: str = "", since: str = "", base_url: str = "",
+                      token: str = "") -> SyncSnapshot:
     """端侧启动全量（不带 since）/ 之后增量（带 since）；since 比较 updatedAt。"""
     TASK_COLS = ("SELECT id,deviceId,title,deviceName,location,status,priority,deadline,"
                  "assignee,inspectionId,checklistJson,updatedAt FROM tasks ")
@@ -861,6 +951,9 @@ def get_sync_snapshot(device_id: str = "", since: str = "", base_url: str = "") 
                               (since,) + dev_args).fetchall()
             trows = c.execute(TASK_COLS + "WHERE updatedAt > ?" + dev
                               + " ORDER BY updatedAt ASC", (since,) + dev_args).fetchall()
+            drows = c.execute("SELECT tableName,recordId,deviceId,deletedAt FROM deleted_records "
+                              "WHERE deletedAt > ?" + dev + " ORDER BY deletedAt ASC",
+                              (since,) + dev_args).fetchall()
         else:
             irows = c.execute("SELECT * FROM inspections WHERE 1=1" + dev
                               + " ORDER BY updatedAt DESC LIMIT 5000", dev_args).fetchall()
@@ -868,15 +961,17 @@ def get_sync_snapshot(device_id: str = "", since: str = "", base_url: str = "") 
                               + " ORDER BY updatedAt DESC LIMIT 5000", dev_args).fetchall()
             trows = c.execute(TASK_COLS + "WHERE 1=1" + dev + " ORDER BY id",
                               dev_args).fetchall()
+            # 全量快照不下发历史墓碑：端侧首次同步直接以服务端为准
+            drows = []
     return SyncSnapshot(
         since=since,
         sinceField="updatedAt",
-        serverTime=_now(),
+        serverTime=_now(),              # 下次原样回传作 since
         devices=list_devices(),
         tasks=[_task_item(r) for r in trows],
         workorders=[WorkOrder(**dict(r)) for r in wrows],
-        inspections=[_inspection_brief(dict(r), base_url) for r in irows],
-        deleted=[],
+        inspections=[_inspection_brief(dict(r), base_url, token) for r in irows],
+        deleted=[dict(r) for r in drows],
     )
 
 
@@ -993,7 +1088,7 @@ def save_trace(session_id: str, events: list[dict], resp: "InspectResp",
                req: "InspectReq", duration_ms: int) -> None:
     """巡检完成后把完整事件流异步存 DB（用于 replay/调试）。"""
     import json as _json
-    now = _now()
+    now = _now_ms()          # v8：毫秒级，同轮事件可精确排序
     events_serializable = []
     for ev in events:
         # 把 Pydantic 对象转 dict
@@ -1003,7 +1098,8 @@ def save_trace(session_id: str, events: list[dict], resp: "InspectResp",
                 clean[k] = v.model_dump()
             else:
                 clean[k] = v
-        clean.setdefault("timestamp", now)   # P2-13: 事件时间（同一轮内精度到秒，顺序看 seq）
+        # P2-13 / v8：事件时间精度到毫秒（历史秒级数据仍兼容）
+        clean.setdefault("timestamp", _now_ms())
         events_serializable.append(clean)
     with _conn() as c:
         cur = c.execute(
@@ -1147,9 +1243,10 @@ def cleanup_old_media(days: int = 90) -> dict:
     cutoff = _days_ago(days)
     with _conn() as c:
         rows = c.execute(
-            "SELECT fileName FROM media WHERE createdAt < ? "
+            "SELECT fileName,thumbnailFile FROM media WHERE createdAt < ? "
             "AND inspectionId NOT IN (SELECT id FROM inspections)", (cutoff,)).fetchall()
-        names = [r["fileName"] for r in rows if r["fileName"]]
+        names = [n for r in rows
+                 for n in (r["fileName"], r["thumbnailFile"]) if n]
     files = 0
     for name in names:
         p = settings.UPLOAD_DIR / name
@@ -1164,6 +1261,50 @@ def cleanup_old_media(days: int = 90) -> dict:
             "DELETE FROM media WHERE createdAt < ? "
             "AND inspectionId NOT IN (SELECT id FROM inspections)", (cutoff,)).rowcount
     return {"rows": rows, "files": files, "retentionDays": days}
+
+
+def delete_inspection(inspection_id: str) -> dict | None:
+    """v8：删除巡检（硬删 + 墓碑，供端侧增量同步感知删除）。
+
+    删除顺序：findings / media 文件 / media 行 / inspections 行 → 写 deleted_records。
+    返回 None 表示记录不存在（路由层转 404）。
+    """
+    with _conn() as c:
+        row = c.execute("SELECT id,deviceId,imageId FROM inspections WHERE id=?",
+                        (inspection_id,)).fetchone()
+        if not row:
+            return None
+        media_rows = c.execute(
+            "SELECT fileName,thumbnailFile FROM media WHERE inspectionId=?",
+            (inspection_id,)).fetchall()
+        names = [n for r in media_rows
+                 for n in (r["fileName"], r["thumbnailFile"]) if n]
+        c.execute("DELETE FROM findings WHERE inspectionId=?", (inspection_id,))
+        c.execute("DELETE FROM media WHERE inspectionId=?", (inspection_id,))
+        c.execute("DELETE FROM inspections WHERE id=?", (inspection_id,))
+        c.execute("INSERT INTO deleted_records(tableName,recordId,deviceId,deletedAt) "
+                  "VALUES('inspections',?,?,?)",
+                  (inspection_id, row["deviceId"] or "", _now_ms()))
+    files = 0
+    for name in names:
+        p = settings.UPLOAD_DIR / name
+        try:
+            if p.is_file():
+                p.unlink()
+                files += 1
+        except OSError:
+            continue
+    return {"deleted": inspection_id, "mediaFiles": files}
+
+
+def run_cleanup_job() -> dict:
+    """v8：定时清理任务体（供 lifespan 后台循环与 DELETE /admin/archive 共用）。"""
+    return {
+        "memories_deleted": cleanup_expired_memories(settings.CLEANUP_DAYS_MEMORIES),
+        "traces_deleted": cleanup_old_traces(settings.CLEANUP_DAYS_TRACES),
+        "media": cleanup_old_media(settings.MEDIA_RETENTION_DAYS),
+        "ranAt": _now(),
+    }
 
 
 def log_alert(level: str, category: str, message: str, detail: str = "") -> None:

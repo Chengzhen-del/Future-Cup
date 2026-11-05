@@ -6,6 +6,7 @@ python-multipart
 openai
 python-dotenv
 Pillow
+reportlab
 
 # ---- 可选：装不上就先注释掉，rag.py 会自动退化为关键词检索 ----
 chromadb

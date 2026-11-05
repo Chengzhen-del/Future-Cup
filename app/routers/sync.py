@@ -15,16 +15,25 @@ def media_base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def request_token(request: Request) -> str:
+    """v8：当前 Bearer token（给图片地址附加 ?token=，/media 已鉴权）。"""
+    parts = request.headers.get("authorization", "").split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return request.query_params.get("token", "")
+
+
 @router.get("/sync/snapshot", response_model=SyncSnapshot,
             summary="启动全量 / 增量同步快照（since 基于 updatedAt）")
 def sync_snapshot(request: Request, deviceId: str = "", since: str = ""):
     """不带 since 拉全量；之后把上一次返回的 serverTime 作为 since 拉增量。
 
     - inspections 固定为 SyncInspection 摘要（不含 findings / steps，详情走 /inspections/{id}）
-    - deleted 为预留删除墓碑，当前无删除接口，恒为空
+    - deleted 为删除墓碑 [{tableName,recordId,deviceId,deletedAt}]，端侧据此本地删除
     """
     return store.get_sync_snapshot(device_id=deviceId, since=since,
-                                   base_url=media_base(request))
+                                   base_url=media_base(request),
+                                   token=request_token(request))
 
 
 @router.post("/sync/conflict", response_model=ConflictResp, summary="冲突仲裁（白名单 + 版本比对）")

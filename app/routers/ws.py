@@ -73,22 +73,24 @@ async def agent_ws(ws: WebSocket, session_id: str):
             if rid:
                 existed = store.get_inspection_by_request_id(rid)
                 if existed:
-                    data = store.inspection_to_resp(existed, _media_base(ws)).model_dump()
+                    tok = ws.query_params.get("token", "")
+                    data = store.inspection_to_resp(
+                        existed, _media_base(ws), tok).model_dump()
                     data["duplicate"] = True
-                    data["imageAbsoluteUrl"] = store.absolute_media_url(
-                        data.get("imageUrl", ""), _media_base(ws))
                     await ws.send_json({"type": "final", "data": data})
                     await ws.send_json({"type": "end"})
                     continue
 
             agent = InspectAgent(req, image_bytes, rid)
+            tok = ws.query_params.get("token", "")
             async for ev in agent.run():
-                # P1-10：WS final 也带完整图片地址
+                # P1-10/v8：WS final 始终重算图片/缩略图绝对地址（确保带 token）
                 if ev.get("type") == "final":
                     d = ev.setdefault("data", {})
-                    if not d.get("imageAbsoluteUrl"):
-                        d["imageAbsoluteUrl"] = store.absolute_media_url(
-                            d.get("imageUrl", ""), _media_base(ws))
+                    d["imageAbsoluteUrl"] = store.absolute_media_url(
+                        d.get("imageUrl", ""), _media_base(ws), tok)
+                    d["imageThumbAbsoluteUrl"] = store.absolute_media_url(
+                        d.get("imageThumbUrl", ""), _media_base(ws), tok)
                 await ws.send_json(ev)
             await ws.send_json({"type": "end"})
     except WebSocketDisconnect:

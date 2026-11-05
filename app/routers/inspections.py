@@ -7,13 +7,16 @@
 """
 import json
 
-from fastapi import (APIRouter, File, Form, Header, HTTPException, Request,
+from fastapi import (APIRouter, Depends, File, Form, Header, HTTPException, Request,
                      UploadFile)
+from fastapi.responses import FileResponse
 
 from app.agent.state_machine import run_once
 from app.config import settings
 from app.schemas import InspectReq, InspectResp
+from app.security import require_role
 from app.services import store
+from app.services.pdf_report import render_inspection_pdf
 
 router = APIRouter(tags=["inspections"])
 
@@ -27,9 +30,19 @@ def _base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
+def _token(request: Request) -> str:
+    """v8：取当前请求的 Bearer token，用于给图片地址附加 ?token=（/media 已鉴权）。"""
+    parts = request.headers.get("authorization", "").split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return request.query_params.get("token", "")
+
+
 def _fill_abs(resp: InspectResp, request: Request) -> InspectResp:
-    if not resp.imageAbsoluteUrl:
-        resp.imageAbsoluteUrl = store.absolute_media_url(resp.imageUrl, _base(request))
+    """v8：始终按当前请求重算绝对地址，确保带上 token（含缩略图）。"""
+    base, token = _base(request), _token(request)
+    resp.imageAbsoluteUrl = store.absolute_media_url(resp.imageUrl, base, token)
+    resp.imageThumbAbsoluteUrl = store.absolute_media_url(resp.imageThumbUrl, base, token)
     return resp
 
 
@@ -51,7 +64,7 @@ async def upload(request: Request,
     if rid:
         existed = store.get_inspection_by_request_id(rid)
         if existed:
-            resp = store.inspection_to_resp(existed, _base(request))
+            resp = store.inspection_to_resp(existed, _base(request), _token(request))
             resp.duplicate = True
             return resp
 
@@ -76,7 +89,7 @@ def list_inspections(request: Request, limit: int = 50, page: int | None = None,
                      startTime: str = "", endTime: str = ""):
     items = store.list_inspections(limit=limit, level=level, device_id=deviceId,
                                    start_time=startTime, end_time=endTime,
-                                   base_url=_base(request))
+                                   base_url=_base(request), token=_token(request))
     return store.paginate(items, page, pageSize)
 
 
@@ -86,4 +99,27 @@ def get_inspection(inspection_id: str, request: Request):
     d = store.get_inspection(inspection_id)
     if not d:
         raise HTTPException(status_code=404, detail="巡检记录不存在")
-    return store.inspection_to_resp(d, _base(request))
+    return store.inspection_to_resp(d, _base(request), _token(request))
+
+
+@router.delete("/inspections/{inspection_id}",
+               summary="删除巡检（admin，硬删并下发同步墓碑）")
+def delete_inspection(inspection_id: str, _user=Depends(require_role("admin"))):
+    d = store.delete_inspection(inspection_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="巡检记录不存在")
+    return {"ok": True, **d}
+
+
+@router.get("/inspections/{inspection_id}/report.pdf",
+            summary="导出巡检报告 PDF（含原图与判读结论）")
+def export_pdf(inspection_id: str):
+    d = store.get_inspection(inspection_id)
+    if not d:
+        raise HTTPException(status_code=404, detail="巡检记录不存在")
+    try:
+        path = render_inspection_pdf(d)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"PDF 生成失败: {e}")
+    return FileResponse(path, media_type="application/pdf",
+                        filename=f"{inspection_id}.pdf")

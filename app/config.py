@@ -57,6 +57,11 @@ class Settings:
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
     MEDIA_RETENTION_DAYS: int = int(os.getenv("MEDIA_RETENTION_DAYS", "90"))
 
+    # ---- 定时清理（v8）：每隔 N 小时清理过期记忆 / Trace / 已归档媒体，0=关闭 ----
+    CLEANUP_INTERVAL_HOURS: int = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+    CLEANUP_DAYS_MEMORIES: int = int(os.getenv("CLEANUP_DAYS_MEMORIES", "180"))
+    CLEANUP_DAYS_TRACES: int = int(os.getenv("CLEANUP_DAYS_TRACES", "30"))
+
     # ---- Token 计费（元 / 百万 tokens，DeepSeek 官方价，可按需改） ----
     LLM_PRICE_INPUT_PER_M: float = float(os.getenv("LLM_PRICE_INPUT_PER_M", "2.0"))
     LLM_PRICE_OUTPUT_PER_M: float = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "8.0"))

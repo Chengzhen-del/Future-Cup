@@ -123,6 +123,8 @@ class InspectResp(BaseModel):
     memories: list[dict] = []
     # 🟢 P1-10/11: 报告页稳定字段——历史详情与 WS final 共用同一 DTO
     imageAbsoluteUrl: str = ""      # 图片完整可访问地址（PUBLIC_BASE_URL 或请求来源 + imageUrl）
+    imageThumbUrl: str = ""         # v8：缩略图（长边 480px），列表首屏优先用它
+    imageThumbAbsoluteUrl: str = "" # v8：缩略图完整地址（已带 token，可直接加载）
     taskId: str = ""
     deviceId: str = ""
     deviceName: str = ""
@@ -242,6 +244,8 @@ class SyncInspection(BaseModel):
     advice: str = ""
     imageUrl: str = ""
     imageAbsoluteUrl: str = ""
+    imageThumbUrl: str = ""
+    imageThumbAbsoluteUrl: str = ""
     workOrderId: str = ""
     capturedAt: str = ""
     createdAt: str = ""
@@ -258,7 +262,7 @@ class SyncSnapshot(BaseModel):
     tasks: list[TaskItem] = []
     workorders: list[WorkOrder] = []
     inspections: list[SyncInspection] = []
-    deleted: list[dict] = []           # 预留删除墓碑；当前无删除接口，恒为空
+    deleted: list[dict] = []           # 删除墓碑 [{tableName,recordId,deviceId,deletedAt}]
 
 
 # ================= P1-7: 冲突仲裁 =================
@@ -329,13 +333,14 @@ class AlertResolveReq(BaseModel):
 
 # ================= P1-12: 媒体生命周期 =================
 class MediaPolicy(BaseModel):
-    urlRule: str = "imageUrl 为 /media/{fileName}；imageAbsoluteUrl 为完整地址（可直接加载）"
+    urlRule: str = ("imageUrl 为 /media/{fileName}；imageAbsoluteUrl 为完整地址（服务端已按当前 "
+                    "token 附加 ?token=，端侧 Image 可直接加载）")
     retentionDays: int = 90
     urlExpiresDays: int = 90          # 图片不做签名，超过保留期随文件清理而失效
-    requiresAuth: bool = False        # /media 为静态资源，不校验 token（内网演示口径）
+    requiresAuth: bool = True         # v8：/media 需 token（Header 或 ?token=）
     keepFailedUploads: bool = False   # 失败上报不落盘（落盘发生在成功之后）
-    thumbnailSupported: bool = False
-    pdfExportSupported: bool = False
-    deleteWithInspection: bool = False  # 当前无删除巡检接口
-    deleteApiSupported: bool = False
+    thumbnailSupported: bool = True   # v8：长边 480px JPEG 缩略图，imageThumbAbsoluteUrl
+    pdfExportSupported: bool = True   # v8：GET /inspections/{id}/report.pdf
+    deleteWithInspection: bool = True # v8：删除巡检会连带删除图片/缩略图/结论
+    deleteApiSupported: bool = True   # v8：DELETE /inspections/{id}（admin）
     note: str = ""

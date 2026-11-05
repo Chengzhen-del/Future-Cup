@@ -27,6 +27,7 @@
 | 13 | `users` | v4 | 人员档案 | 登录 / 组织维护 |
 | 14 | `token_usage` | v5 | Token 用量与成本 | 每次 LLM 调用 |
 | 15 | `auth_tokens` | v6 | 登录 token（access / refresh） | 登录 / 刷新 / 登出 |
+| 16 | `deleted_records` | v8 | 删除墓碑（增量同步下发） | 删除巡检时 |
 
 ---
 
@@ -153,9 +154,10 @@ erDiagram
 | fileName | TEXT | | 落盘文件名（`data/uploads`） |
 | mimeType | TEXT | | image/jpeg 等 |
 | sizeKb | INTEGER | | 文件大小 |
+| thumbnailFile | TEXT | v8 | 缩略图文件名（长边 480px JPEG，空表示未生成） |
 | createdAt | TEXT | | 上传时间 |
 
-访问路径：`GET /media/{fileName}`（静态挂载）。
+访问路径：`GET /media/{fileName}`（**v8 起为鉴权端点**，支持 Bearer 或 `?token=`）。
 
 ### 3.7 `schema_version` 迁移版本
 
@@ -397,3 +399,50 @@ sequenceDiagram
 v7 未新增索引。`updatedAt` 上的增量查询走小表全表扫描（≤5000 条上限），
 当前数据量下无需索引；若接入设备数超过 200，建议补
 `CREATE INDEX idx_insp_updated ON inspections(updatedAt)`。
+
+---
+
+## 8. v8 迁移（端侧清单收尾，2026-11）
+
+表数量由 **15 增至 16**（新增 `deleted_records`）。
+
+### 8.1 新增字段
+
+| 表 | 字段 | 类型 | 说明 |
+|---|---|---|---|
+| `media` | `thumbnailFile` | TEXT | 缩略图文件名（长边 480px、JPEG q80）；生成失败为空，不影响原图 |
+
+### 8.2 新增表 `deleted_records`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | INTEGER PK AUTOINCREMENT | 自增 |
+| tableName | TEXT | 目前只有 `inspections` |
+| recordId | TEXT | 被删记录 ID |
+| deviceId | TEXT | 所属设备，便于按设备增量拉取 |
+| deletedAt | TEXT | 删除时刻（**毫秒精度**），`/sync/snapshot?since=` 按它过滤 |
+
+索引：`idx_deleted_at(deletedAt)`
+
+### 8.3 迁移时自动完成
+
+1. `_ensure_column(media, thumbnailFile)` 幂等加列
+2. 建 `deleted_records` 表与索引
+3. 为已有图片批量补生成缩略图（文件已存在则跳过，缺原图则忽略）
+4. 补写 `reviewer` 默认账号（`reviewer/reviewer123`，已存在则跳过）
+5. `schema_version` 写入 8
+
+### 8.4 写入时机
+
+| 动作 | 写入 |
+|---|---|
+| 巡检落盘带图 | 原图 + 缩略图两个文件；`media.thumbnailFile` 记录缩略图名 |
+| `DELETE /inspections/{id}` | 删 `inspections / findings / media` 行与两个文件，并写 `deleted_records` |
+| 定时清理 | 每 `CLEANUP_INTERVAL_HOURS` 小时执行 `run_cleanup_job()`（记忆 / Trace / 已归档媒体） |
+| Trace 落库 | `agent_traces.createdAt` 与事件 `timestamp` 使用毫秒精度 |
+
+### 8.5 数据一致性说明
+
+- `deleted_records` 只增不删，当前数据量可忽略；若需清理，可与 Trace 一起按 180 天清。
+- 缩略图与原图**同生同灭**：删除巡检、清理归档媒体都会同时处理两个文件。
+- 全量快照（不带 `since`）不返回历史墓碑，端侧首次同步以服务端数据为准。

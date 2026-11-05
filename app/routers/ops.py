@@ -1,10 +1,11 @@
 """可观测与运维接口：Trace 回放 / 告警处理 / Token 成本 / 媒体策略（P2-13、P2-14、P2-15、P1-12）。"""
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import settings
 from app.schemas import AlertItem, AlertResolveReq, MediaPolicy, TraceDetail
+from app.security import require_role
 from app.services import store
 
 router = APIRouter(tags=["ops"])
@@ -53,8 +54,9 @@ def list_alerts(unresolved: bool = True, limit: int = 50, level: str = "",
             "page": data["page"], "pageSize": data["pageSize"]}
 
 
-@router.post("/alerts/{alert_id}/resolve", summary="处理告警（记录处理人/时间/备注）")
-def resolve_alert(alert_id: int, request: Request, body: AlertResolveReq | None = None):
+@router.post("/alerts/{alert_id}/resolve", summary="处理告警（admin/reviewer，记录处理人/时间/备注）")
+def resolve_alert(alert_id: int, request: Request, body: AlertResolveReq | None = None,
+                  _user=Depends(require_role("admin", "reviewer"))):
     user = getattr(request.state, "user", None) or {}
     d = store.resolve_alert(alert_id, note=(body.note if body else ""),
                             user_id=user.get("userId", ""))
@@ -76,7 +78,9 @@ def media_policy():
     return MediaPolicy(
         retentionDays=settings.MEDIA_RETENTION_DAYS,
         urlExpiresDays=settings.MEDIA_RETENTION_DAYS,
-        note=(f"原图/录音保留 {settings.MEDIA_RETENTION_DAYS} 天，超过后随归档由 "
-              "DELETE /admin/archive 一并清理（巡检仍在主表的图片不会删）；"
-              "失败上报不落盘；暂不支持缩略图与 PDF 导出；当前无删除巡检接口。"),
+        note=(f"原图/录音保留 {settings.MEDIA_RETENTION_DAYS} 天，超过后由定时清理"
+              f"（每 {settings.CLEANUP_INTERVAL_HOURS} 小时）或 DELETE /admin/archive 清理；"
+              "缩略图与原图同生同灭；删除巡检会连带删除图片/缩略图/结论；"
+              "PDF 导出：GET /inspections/{id}/report.pdf；"
+              "图片地址已自动附带当前 token，端侧可直接加载。"),
     )

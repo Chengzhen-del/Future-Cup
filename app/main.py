@@ -5,10 +5,12 @@
 """
 import asyncio
 import logging
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.security import require_role
@@ -21,6 +23,22 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("inspectagent")
+
+
+async def _cleanup_loop() -> None:
+    """v8：定时清理（记忆 / Trace / 已归档媒体），间隔 CLEANUP_INTERVAL_HOURS，0=关闭。"""
+    from app.services import store
+    interval = settings.CLEANUP_INTERVAL_HOURS * 3600
+    if interval <= 0:
+        log.info("定时清理已关闭（CLEANUP_INTERVAL_HOURS=0）")
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            res = await asyncio.to_thread(store.run_cleanup_job)
+            log.info("定时清理完成: %s", res)
+        except Exception as e:  # noqa: BLE001
+            log.warning("定时清理失败: %s", e)
 
 
 @asynccontextmanager
@@ -37,7 +55,9 @@ async def lifespan(app: FastAPI):
         # 放后台线程：首次建索引要下载 embedding 模型，不能挡住启动
         log.info("RAG_ENABLED=1，后台构建向量索引（首次较慢）")
         asyncio.get_running_loop().run_in_executor(None, rag.build_index)
+    cleanup_task = asyncio.create_task(_cleanup_loop())
     yield
+    cleanup_task.cancel()
 
 
 app = FastAPI(
@@ -94,15 +114,34 @@ def run_archive(days: int = 90, _user=Depends(require_role("admin"))):
 def run_cleanup(days_memories: int = 180, days_traces: int = 30,
                 days_media: int | None = None, _user=Depends(require_role("admin"))):
     """清理过期记忆 / Trace / 已归档媒体的物理文件，仅 admin。"""
-    from app.config import settings
     from app.services import store
-    media = store.cleanup_old_media(days_media or settings.MEDIA_RETENTION_DAYS)
-    return {"memories_deleted": store.cleanup_expired_memories(days_memories),
-            "traces_deleted": store.cleanup_old_traces(days_traces),
-            "media": media}
+    return {
+        "memories_deleted": store.cleanup_expired_memories(days_memories),
+        "traces_deleted": store.cleanup_old_traces(days_traces),
+        "media": store.cleanup_old_media(days_media or settings.MEDIA_RETENTION_DAYS),
+    }
 
-# 取回巡检现场图片（报告页展示用）
-app.mount("/media", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="media")
+
+# v8：/media 改为鉴权端点（原 StaticFiles 无法校验 token）。
+# 端侧 Image 组件不能带 Header，因此同时支持 ?token=xxx。
+_MEDIA_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp|gif|bmp|wav|mp3|m4a|mp4)$")
+
+
+@app.get("/media/{filename}", tags=["media"], summary="巡检现场图片/音频（需 token）")
+def get_media(filename: str, request: Request):
+    if not _MEDIA_NAME_RE.match(filename):
+        return errors.fail(request, 404, "媒体文件不存在", "NOT_FOUND")
+    path = settings.UPLOAD_DIR / filename
+    if not path.is_file():
+        return errors.fail(request, 404, "媒体文件不存在", "NOT_FOUND")
+    if settings.AUTH_ENABLED:
+        from app.services import store
+        parts = request.headers.get("authorization", "").split()
+        token = (parts[1] if len(parts) == 2 and parts[0].lower() == "bearer"
+                 else request.query_params.get("token", ""))
+        if not store.verify_token(token):
+            return errors.fail(request, 401, "访问媒体文件需要有效 token", "UNAUTHORIZED")
+    return FileResponse(path)
 
 # Web 测试台（打开 http://localhost:8000/ 即可使用）
 WEB_DIR = Path(__file__).resolve().parents[1] / "web"
