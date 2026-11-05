@@ -98,7 +98,7 @@ def render_inspection_pdf(d: dict) -> str:
     ]
     tbl = Table([[Paragraph(f"<b>{_esc(a)}</b>", base), _p(b, base),
                   Paragraph(f"<b>{_esc(c)}</b>", base), _p(dd, base)] for a, b, c, dd in info],
-                colWidths=[24 * mm, 62 * mm, 24 * mm, 62 * mm])
+                colWidths=[24 * mm, 62 * mm, 24 * mm, 62 * mm], splitInRow=1)
     tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f5f7fa")),
@@ -143,7 +143,8 @@ def render_inspection_pdf(d: dict) -> str:
                           f'{"异常" if bad else "正常"}</font>', base),
                 _p(f.get("basis"), base),
             ])
-        ft = Table(rows, colWidths=[34 * mm, 52 * mm, 16 * mm, 70 * mm], repeatRows=1)
+        ft = Table(rows, colWidths=[34 * mm, 52 * mm, 16 * mm, 70 * mm], repeatRows=1,
+                   splitInRow=1)
         ft.setStyle(TableStyle([
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef3f9")),
