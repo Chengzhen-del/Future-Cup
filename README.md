@@ -117,14 +117,19 @@ sequenceDiagram
 ```
 inspectagent-cloud/
 ├─ app/
-│  ├─ main.py                 入口 + 同步/归档/告警/统计端点 + 静态挂载
-│  ├─ config.py               所有开关集中在此（模型、阈值、价格、RAG 开关）
+│  ├─ main.py                 入口 + 定时清理后台任务 + 媒体鉴权端点 + 归档端点
+│  ├─ security.py             RBAC：require_role() 依赖注入（inspector/reviewer/admin）
+│  ├─ config.py               所有开关集中在此（模型、阈值、价格、RAG 开关、清理间隔）
+│  ├─ errors.py               统一错误信封 {code,message,detail,traceId} + trace 中间件
 │  ├─ schemas.py              端云数据契约（字段与端侧 ets/model 一一对应）
 │  ├─ routers/
-│  │  ├─ tasks.py             任务 / 设备 / 工单 / 配置
-│  │  ├─ inspections.py       巡检上报（multipart / JSON）
+│  │  ├─ auth.py              登录 / 刷新 / 登出 / me（token 落库，重启不掉线）
+│  │  ├─ tasks.py             任务 / 设备 / 工单（含冲突/状态校验）
+│  │  ├─ inspections.py       巡检上报（multipart / JSON）+ PDF 导出 + 删除
+│  │  ├─ sync.py              同步快照 / 冲突仲裁（v7+）
+│  │  ├─ ops.py               Trace 回放 / 告警中心 / Token 统计 / 媒体策略
 │  │  ├─ kb.py                知识库状态 / 重建
-│  │  └─ ws.py                WebSocket 流式
+│  │  └─ ws.py                WebSocket 流式（幂等回放 + requestId）
 │  ├─ agent/
 │  │  ├─ state_machine.py     六步状态机 + ReAct + 记忆 + 反问（核心）
 │  │  ├─ tools.py             8 个 Function Calling 工具 + dispatch 路由
@@ -134,6 +139,7 @@ inspectagent-cloud/
 │     ├─ llm.py               DeepSeek 封装（chat / chat_json / tool_loop / stream）
 │     ├─ vision.py            Qwen-VL 封装（4 个视觉工具）
 │     ├─ rag.py               Chroma 检索 + 关键词兜底 + 记忆索引
+│     ├─ pdf_report.py        v8：巡检报告 PDF 导出（reportlab + 中文字体）
 │     └─ store.py             SQLite（16 张表 / v8 迁移 / 归档 / 统计 / 定时清理）
 ├─ knowledge/rules.md         RAG 语料（110 条）
 ├─ web/                       豆包风格测试台（纯静态，无内联脚本）
@@ -352,11 +358,26 @@ flowchart TB
 
 | 能力 | 端点 / 表 | 说明 |
 |---|---|---|
-| Trace 回放 | `GET /api/v1/traces`、`/traces/{id}` | 完整事件流 JSON，可逐帧复现一次推理 |
-| Token 成本 | `GET /api/v1/stats/tokens?days=7` | 总览 / 按天 / 按调用方 / 按模型 |
-| 告警中心 | `GET /api/v1/alerts`、`POST /alerts/{id}/resolve` | LLM 熔断、RAG 降级、工具失败 |
-| 数据归档 | `POST/DELETE /api/v1/admin/archive` | 90 天巡检归档，记忆 180 天、Trace 30 天清理 |
-| 端侧同步 | `GET /api/v1/sync/snapshot`、`POST /sync/conflict` | 全量快照 / 增量（`since`）/ 冲突仲裁 |
+| Trace 回放 | `GET /api/v1/traces`、`/traces/{id}` | 完整事件流 JSON，可逐帧复现一次推理；事件时间精度到**毫秒** |
+| Token 成本 | `GET /api/v1/stats/tokens?days=7` | 总览 / 按天 / 按调用方 / 按模型 / 按用户 / 按设备 / 按会话 |
+| 告警中心 | `GET /api/v1/alerts`、`POST /alerts/{id}/resolve` | LLM 熔断、RAG 降级、工具失败；处理人/时间/备注自动填 |
+| 同步与冲突 | `GET /api/v1/sync/snapshot`、`POST /sync/conflict` | 全量快照 / 增量（`since` 基于 `updatedAt`）/ 冲突仲裁白名单 |
+| 媒体生命周期 | `GET /api/v1/system/media-policy` | 缩略图 / PDF / 删除巡检 / `/media` 鉴权 / 清理策略 |
+| 删除巡检 | `DELETE /api/v1/inspections/{id}`（admin） | 硬删 + 连带删媒体 + 写删除墓碑（端侧增量同步自动感知） |
+| PDF 报告 | `GET /api/v1/inspections/{id}/report.pdf` | A4 含基本信息、结论、逐项判读、现场照片、执行步骤 |
+| 定时清理 | 内置后台任务 | 每 `CLEANUP_INTERVAL_HOURS`（默认 24h）清记忆 180d / Trace 30d / 已归档媒体 90d |
+| 手动清理 | `POST/DELETE /api/v1/admin/archive` | 90 天巡检归档，记忆 180 天、Trace 30 天清理；仅 admin |
+| 统一错误 | `{code,message,detail,traceId}` + `X-Trace-Id` | 覆盖 400/401/403/404/409/413/422/500；反馈问题带 traceId 即可定位 |
+
+### 角色权限
+
+| 账号 | 角色 | 能做什么 |
+|---|---|---|
+| `admin / admin123` | admin | 全部：上报、删巡检、归档/清理、看 Trace/Token 统计、处理告警 |
+| `inspector / inspector123` | inspector | 上报巡检、看任务/工单/历史、处理告警；**不能删巡检、不能归档** |
+| `reviewer / reviewer123` | reviewer | 只读 + 处理告警；**不能上报巡检、不能删巡检** |
+
+权限不足统一返回 `403 FORBIDDEN`。RBAC 入口在 `app/security.py`，用 FastAPI 依赖注入。
 
 Token 统计按调用方分桶，便于定位成本大头：
 
@@ -407,6 +428,23 @@ python scripts\test_llm.py     # 模型连通性自检
 | `LLM_PRICE_INPUT_PER_M` | `2.0` | 输入价格（元 / 百万 token） |
 | `LLM_PRICE_OUTPUT_PER_M` | `8.0` | 输出价格（元 / 百万 token） |
 | `MOCK_MODE` | 空 | 强制 mock 用于端侧联调 |
+| `PUBLIC_BASE_URL` | 空 | 图片绝对地址基址；留空则用请求来源 |
+| `MEDIA_RETENTION_DAYS` | `90` | 原图/录音保留天数 |
+| `CLEANUP_INTERVAL_HOURS` | `24` | 定时清理间隔，`0` 关闭 |
+| `CLEANUP_DAYS_MEMORIES` | `180` | 历史记忆保留天数 |
+| `CLEANUP_DAYS_TRACES` | `30` | Trace 保留天数 |
+
+### 默认账号（首次建库时自动写入）
+
+| 账号 | 密码 | 角色 |
+|---|---|---|
+| `admin` | `admin123` | admin（全部权限） |
+| `inspector` | `inspector123` | inspector（上报 + 查询） |
+| `reviewer` | `reviewer123` | reviewer（只读 + 处理告警） |
+
+> `/media` 鉴权：`AUTH_ENABLED=1` 时无 token 返回 `401`。
+> 接口返回的 `imageAbsoluteUrl` / `imageThumbAbsoluteUrl` **已自动附加当前 token**，
+> 端侧 `Image` 组件可直接加载，token 过期（默认 2h）后重新拉取列表即可。
 
 ---
 
@@ -415,7 +453,8 @@ python scripts\test_llm.py     # 模型连通性自检
 | 文档 | 内容 |
 |---|---|
 | [交付说明.md](交付说明.md) | **给端侧的一页纸**：起服务、联调 5 步、演示前检查、已知限制 |
-| [docs/api.md](docs/api.md) | 39 个接口的 method / path / 参数 / 返回 / 示例 |
-| [docs/database.md](docs/database.md) | 16 张表字段级设计、索引、ER 关系、生命周期 |
-| `D:\d\Huawei_project\docs\端侧开发任务表.md` | 端侧单人从零实施路线 / 接口缺口 / 验收门槛 |
+| [docs/api.md](docs/api.md) | 39 个接口的 method / path / 参数 / 返回 / 示例（第 13 章 v8 变更） |
+| [docs/database.md](docs/database.md) | 16 张表字段级设计、索引、ER 关系、生命周期（第 8 章 v8 迁移） |
+| [docs/端侧优化回复.md](docs/端侧优化回复.md) | 15 条建议逐条验收 + 给端侧的联调建议（v8） |
+| `D:\d\Huawei_project\docs\端侧开发任务表.md` | 端侧单人从零实施路线 / 接口缺口 / 验收门槛（0.2 节为 v8） |
 | `d:\d\未来杯\智巡InspectAgent_数据与接口总体规划.md` | 全局主纲（冲突时以主纲为准） |
