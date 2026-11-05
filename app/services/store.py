@@ -1006,13 +1006,17 @@ def save_trace(session_id: str, events: list[dict], resp: "InspectResp",
         clean.setdefault("timestamp", now)   # P2-13: 事件时间（同一轮内精度到秒，顺序看 seq）
         events_serializable.append(clean)
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             "INSERT INTO agent_traces(sessionId,inspectionId,taskId,deviceId,deviceName,"
             "level,confidence,durationMs,eventsJson,createdAt) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (session_id, resp.inspectionId or "", req.taskId or "",
              req.deviceId or "", req.deviceName or "",
              resp.level, resp.confidence, duration_ms,
              _json.dumps(events_serializable, ensure_ascii=False), now))
+        # P2-15：把本轮 token 记录回填 traceId，Token 统计可按 Trace 下钻
+        if session_id:
+            c.execute("UPDATE token_usage SET traceId=? WHERE sessionId=? AND traceId=0",
+                      (cur.lastrowid, session_id))
 
 
 def _normalize_events(events: list, fallback_ts: str = "") -> list[dict]:
@@ -1133,6 +1137,33 @@ def cleanup_old_traces(days: int = 30) -> int:
     cutoff = _days_ago(days)
     with _conn() as c:
         return c.execute("DELETE FROM agent_traces WHERE createdAt < ?", (cutoff,)).rowcount
+
+
+def cleanup_old_media(days: int = 90) -> dict:
+    """P1-12：清理已归档巡检的媒体文件与登记（保留期内或主表仍存在的保留）。
+
+    只删“超过 N 天且对应巡检已不在主表（已归档）”的记录，避免报告页图片 404。
+    """
+    cutoff = _days_ago(days)
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT fileName FROM media WHERE createdAt < ? "
+            "AND inspectionId NOT IN (SELECT id FROM inspections)", (cutoff,)).fetchall()
+        names = [r["fileName"] for r in rows if r["fileName"]]
+    files = 0
+    for name in names:
+        p = settings.UPLOAD_DIR / name
+        try:
+            if p.is_file():
+                p.unlink()
+                files += 1
+        except OSError:
+            continue
+    with _conn() as c:
+        rows = c.execute(
+            "DELETE FROM media WHERE createdAt < ? "
+            "AND inspectionId NOT IN (SELECT id FROM inspections)", (cutoff,)).rowcount
+    return {"rows": rows, "files": files, "retentionDays": days}
 
 
 def log_alert(level: str, category: str, message: str, detail: str = "") -> None:

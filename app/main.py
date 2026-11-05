@@ -7,9 +7,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
+from app.security import require_role
 
 from app import errors
 from app.config import settings
@@ -82,19 +84,22 @@ app.include_router(ws.router)
 
 # 🟢 数据归档 API（低频运维，保留在 main 里）
 @app.post("/api/v1/admin/archive")
-def run_archive(days: int = 90):
-    """手动触发归档（把 N 天前的巡检移到 archived_inspections）。"""
+def run_archive(days: int = 90, _user=Depends(require_role("admin"))):
+    """手动触发归档（把 N 天前的巡检移到 archived_inspections），仅 admin。"""
     from app.services import store
     return store.archive_old_data(days)
 
 
 @app.delete("/api/v1/admin/archive")
-def run_cleanup(days_memories: int = 180, days_traces: int = 30):
-    """清理过期记忆和 Trace（默认记忆 180 天/Trace 30 天）。"""
+def run_cleanup(days_memories: int = 180, days_traces: int = 30,
+                days_media: int | None = None, _user=Depends(require_role("admin"))):
+    """清理过期记忆 / Trace / 已归档媒体的物理文件，仅 admin。"""
+    from app.config import settings
     from app.services import store
-    mem = store.cleanup_expired_memories(days_memories)
-    trc = store.cleanup_old_traces(days_traces)
-    return {"memories_deleted": mem, "traces_deleted": trc}
+    media = store.cleanup_old_media(days_media or settings.MEDIA_RETENTION_DAYS)
+    return {"memories_deleted": store.cleanup_expired_memories(days_memories),
+            "traces_deleted": store.cleanup_old_traces(days_traces),
+            "media": media}
 
 # 取回巡检现场图片（报告页展示用）
 app.mount("/media", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="media")

@@ -75,7 +75,8 @@ def token_stats(days: int = 7):
 def media_policy():
     return MediaPolicy(
         retentionDays=settings.MEDIA_RETENTION_DAYS,
-        keepFailedUploads=settings.KEEP_FAILED_UPLOADS,
-        note=(f"原图/录音保留 {settings.MEDIA_RETENTION_DAYS} 天（随归档清理）；"
-              "巡检记录删除时同步删除 media 登记；暂不支持缩略图与 PDF 导出。"),
+        urlExpiresDays=settings.MEDIA_RETENTION_DAYS,
+        note=(f"原图/录音保留 {settings.MEDIA_RETENTION_DAYS} 天，超过后随归档由 "
+              "DELETE /admin/archive 一并清理（巡检仍在主表的图片不会删）；"
+              "失败上报不落盘；暂不支持缩略图与 PDF 导出；当前无删除巡检接口。"),
     )

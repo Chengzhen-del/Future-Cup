@@ -21,6 +21,10 @@ class WorkOrderPatch(BaseModel):
     handleNote: str = ""
 
 
+TASK_STATUSES = {"待巡检", "进行中", "已完成"}
+WO_STATUSES = {"待处理", "处理中", "已闭环"}
+
+
 @router.get("/config", response_model=ServerConfig, summary="拉取阈值/开关")
 def config():
     return ServerConfig(confidenceThreshold=settings.CONFIDENCE_THRESHOLD,
@@ -47,6 +51,10 @@ def task_detail(task_id: str):
 
 @router.patch("/tasks/{task_id}/status", response_model=TaskItem, summary="改任务状态")
 def task_status(task_id: str, body: TaskStatusPatch):
+    if body.status not in TASK_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "code": "VALIDATION_ERROR",
+            "message": f"status 只能是 {'/'.join(sorted(TASK_STATUSES))}"})
     t = store.update_task_status(task_id, body.status, body.inspectionId)
     if not t:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -94,6 +102,15 @@ def workorder_detail(wo_id: str):
 
 @router.patch("/workorders/{wo_id}/status", summary="工单流转（处理中/已闭环）")
 def workorder_status(wo_id: str, body: WorkOrderPatch):
+    if body.status not in WO_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "code": "VALIDATION_ERROR",
+            "message": f"status 只能是 {'/'.join(sorted(WO_STATUSES))}"})
+    cur = store.get_workorder(wo_id)
+    if cur and cur.status == "已闭环" and body.status != "已闭环":
+        raise HTTPException(status_code=409, detail={
+            "code": "CONFLICT",
+            "message": "工单已闭环，不可回退"})
     wo = store.update_workorder_status(wo_id, body.status, body.handleNote)
     if not wo:
         raise HTTPException(status_code=404, detail="工单不存在")

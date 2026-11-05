@@ -463,7 +463,8 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 1. 非白名单字段一律进 `rejected`，不落库；
 2. `cloud_version` == 服务端当前 `updatedAt` → 云端没被别人改过，接受端侧改动（`winner=device`）；
 3. 否则云端记录已变更，以云端为准（`winner=cloud`，`applied=[]`）；
-4. 记录不存在 → `resolved=false`，`winner=cloud`。
+4. 记录不存在 → 视为**云端已删除**：`resolved=false`，`winner=cloud`，`final={}`，
+   端侧应删除本地副本（这就是删除冲突的处理规则）。
 
 端侧统一用 `final` 覆盖本地副本，并用响应里的 `cloudVersion` 更新本地版本号。
 
@@ -471,13 +472,22 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 
 ```json
 { "urlRule": "imageUrl 为 /media/{fileName}，imageAbsoluteUrl 为完整地址",
-  "retentionDays": 90, "keepFailedUploads": false,
-  "thumbnailSupported": false, "pdfExportSupported": false,
-  "deleteWithInspection": true, "note": "..." }
+  "retentionDays": 90, "urlExpiresDays": 90, "requiresAuth": false,
+  "keepFailedUploads": false, "thumbnailSupported": false, "pdfExportSupported": false,
+  "deleteWithInspection": false, "deleteApiSupported": false, "note": "..." }
 ```
 
-媒体生命周期统一策略：原图/录音保留 `MEDIA_RETENTION_DAYS`（默认 90 天），
-随归档一并清理；巡检删除时同步删除 media 登记；当前不提供缩略图与 PDF 导出。
+媒体生命周期统一策略（已落地，不只是声明）：
+
+| 问题 | 结论 |
+|---|---|
+| 原图/录音保留多久 | `MEDIA_RETENTION_DAYS`（默认 90 天） |
+| 谁来清理 | `DELETE /admin/archive` 调用 `cleanup_old_media()`，**只删已归档巡检的媒体**，主表仍在的图片不删 |
+| 失败上传是否保留 | 不保留（落盘发生在巡检成功之后） |
+| 删除巡检是否删媒体 | 当前**没有删除巡检接口**，`deleteApiSupported=false` |
+| 缩略图 / PDF 导出 | 暂不支持 |
+| 图片鉴权与有效期 | `/media` 为静态资源，**不校验 token**（内网演示口径），超过保留期随文件清理而失效，不做签名 URL |
+
 `imageUrl` 始终是相对路径（不变），跨网访问请读 `imageAbsoluteUrl`（绝对地址，
 基址优先取 `PUBLIC_BASE_URL` 环境变量，其次取请求来源）。
 
@@ -515,6 +525,7 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 | 401 | `UNAUTHORIZED` | 未登录 / token 过期 | 用 refreshToken 换新 token，失败则跳登录 |
 | 403 | `FORBIDDEN` | 无权限 | 提示无权限 |
 | 404 | `NOT_FOUND` | 任务 / 设备 / 工单 / 巡检 / Trace / 告警不存在 | 提示并回列表 |
+| 409 | `CONFLICT` | 业务状态冲突，如工单已闭环再次回退 | 提示"该工单已闭环"，刷新详情 |
 | 413 | `PAYLOAD_TOO_LARGE` | 图片 > 10MB | 先压缩到长边 ≤1280 再传 |
 | 422 | `VALIDATION_ERROR` | 请求体字段类型不符（Pydantic 校验） | 按 `/docs` 的定义修正，`detail` 里有具体字段 |
 | 500 | `INTERNAL_ERROR` | 云端异常 | 提示"服务暂时不可用"，保留本地缓存，带 `traceId` 反馈 |
@@ -560,7 +571,7 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 - `expiresIn` 单位秒（默认 120 分钟）；refresh 默认 7 天
 - token 落库，**服务重启后仍有效**；logout 只吊销当前 access token
 - 默认账号（首次建库自动写入）：`admin/admin123`、`inspector/inspector123`
-- 401 响应：`{"detail":{"code":"UNAUTHORIZED","message":"未登录或 token 已失效"}}`
+- 401 响应（v7 起统一结构）：`{"code":"UNAUTHORIZED","message":"未登录或 token 已失效","detail":"","traceId":"..."}`
 
 端侧处理：启动时若无 token → 登录页；收到 401 → 用 refreshToken 换新 access；refresh 也 401 → 回登录页。
 
@@ -635,4 +646,17 @@ imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字�
 |---|---|---|
 | `PUBLIC_BASE_URL` | 空 | 图片绝对地址基址，如 `http://192.168.1.10:8000`；空则用请求来源 |
 | `MEDIA_RETENTION_DAYS` | 90 | 原图/录音保留天数 |
-| `KEEP_FAILED_UPLOADS` | 0 | 失败上传是否保留媒体文件 |
+
+### 12.4 角色权限（可验证）
+
+| 能力 | inspector | reviewer | admin |
+|---|---|---|---|
+| 登录 / me / 刷新 / 登出 | ✅ | ✅ | ✅ |
+| 任务、设备、工单、巡检、Trace、Token 统计查询 | ✅ | ✅ | ✅ |
+| 改任务状态、上报巡检、工单流转、处理告警 | ✅ | ✅ | ✅ |
+| 归档 / 清理（`/admin/archive`） | ❌ 403 | ❌ 403 | ✅ |
+
+- 角色来自 `users.role`，随 token 一起校验，**不信任前端传参**
+- 权限不足统一返回 `403 FORBIDDEN`（`{code,message,detail,traceId}`）
+- 当前默认账号只有 `admin` 与 `inspector`，`reviewer` 角色已支持校验，账号按需在 `users` 表添加
+- 验收命令：用 inspector token 调 `POST /api/v1/admin/archive` 应得到 403，用 admin token 得到 200

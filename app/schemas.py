@@ -331,8 +331,11 @@ class AlertResolveReq(BaseModel):
 class MediaPolicy(BaseModel):
     urlRule: str = "imageUrl 为 /media/{fileName}；imageAbsoluteUrl 为完整地址（可直接加载）"
     retentionDays: int = 90
-    keepFailedUploads: bool = False
+    urlExpiresDays: int = 90          # 图片不做签名，超过保留期随文件清理而失效
+    requiresAuth: bool = False        # /media 为静态资源，不校验 token（内网演示口径）
+    keepFailedUploads: bool = False   # 失败上报不落盘（落盘发生在成功之后）
     thumbnailSupported: bool = False
     pdfExportSupported: bool = False
-    deleteWithInspection: bool = True
+    deleteWithInspection: bool = False  # 当前无删除巡检接口
+    deleteApiSupported: bool = False
     note: str = ""
