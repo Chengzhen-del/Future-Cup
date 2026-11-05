@@ -47,10 +47,33 @@ app = FastAPI(
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"], allow_credentials=False)
 
+app.include_router(auth.router, prefix="/api/v1")
 app.include_router(tasks.router, prefix="/api/v1")
 app.include_router(inspections.router, prefix="/api/v1")
 app.include_router(kb.router, prefix="/api/v1")
 app.include_router(ws.router)
+
+
+# 🟢 P0-3: 登录鉴权中间件（AUTH_ENABLED=1 时生效；登录/刷新与 OPTIONS 预检放行）
+_AUTH_WHITELIST = {"/api/v1/auth/login", "/api/v1/auth/refresh"}
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    if (settings.AUTH_ENABLED and request.method != "OPTIONS"
+            and request.url.path.startswith("/api/")
+            and request.url.path not in _AUTH_WHITELIST):
+        from app.services import store
+        parts = request.headers.get("authorization", "").split()
+        token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else ""
+        info = store.verify_token(token) if token else None
+        if not info:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={
+                "detail": {"code": "UNAUTHORIZED",
+                           "message": "未登录或 token 已失效"}})
+        request.state.user = info
+    return await call_next(request)
 
 
 # 🟢 P3-1: Trace 查询端点（生产级 Agent 调试必备）

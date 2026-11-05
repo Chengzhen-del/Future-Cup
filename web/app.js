@@ -24,6 +24,39 @@ async function checkHealth() {
   }
 }
 
+// ── 鉴权（后端默认开启，测试台自动用 admin 登录）──
+let authToken = sessionStorage.getItem('ia_token') || '';
+let tokenAt = Number(sessionStorage.getItem('ia_token_at') || 0);
+const TOKEN_TTL_MS = 100 * 60 * 1000;   // 后端默认 120 分钟，留 20 分钟余量
+
+async function ensureToken(force) {
+  if (!force && authToken && Date.now() - tokenAt < TOKEN_TTL_MS) return authToken;
+  const base = $('baseUrl').value.replace(/\/$/, '');
+  const u = ($('authUser') && $('authUser').value) || 'admin';
+  const p = ($('authPass') && $('authPass').value) || 'admin123';
+  try {
+    const r = await fetch(base + '/api/v1/auth/login', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ username: u, password: p })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    authToken = j.accessToken || '';
+    tokenAt = Date.now();
+    sessionStorage.setItem('ia_token', authToken);
+    sessionStorage.setItem('ia_token_at', String(tokenAt));
+    addMsg('system', '🔑 已登录：' + (j.user ? j.user.name + ' / ' + j.user.role : u));
+  } catch (e) {
+    authToken = '';
+    addMsg('system', '⚠ 登录失败（' + e.message + '）：若后端 AUTH_ENABLED=0 可忽略');
+  }
+  return authToken;
+}
+
+function authHeaders(extra) {
+  return Object.assign({ Authorization: 'Bearer ' + authToken }, extra || {});
+}
+
 // ── 模式 / 传输切换 ──
 function initSegButtons(sel, handler) {
   $$(sel).forEach(function(b) {
@@ -292,7 +325,7 @@ function finishRunning() {
 }
 
 // ── WebSocket 流式 ──
-function startWs(prebuiltReq) {
+async function startWs(prebuiltReq) {
   if (running) return;
   running = true;
   $('startBtn').disabled = true;
@@ -300,8 +333,10 @@ function startWs(prebuiltReq) {
 
   var req = prebuiltReq || addUserMsg();
   var base = $('baseUrl').value.replace(/\/$/, '');
+  await ensureToken();
   var sid = Date.now().toString(16) + Math.floor(Math.random()*0xFFFF).toString(16);
-  var wsUrl = base.replace('http', 'ws') + '/ws/agent/' + sid;
+  var wsUrl = base.replace('http', 'ws') + '/ws/agent/' + sid
+            + '?token=' + encodeURIComponent(authToken || '');
 
   $('connInfo').textContent = '⏳ 连接 WS…';
   console.log('WS 连接:', wsUrl);
@@ -381,6 +416,8 @@ async function startHttp(prebuiltReq) {
   addMsg('bot', '🤖 Agent 开始工作（HTTP 一次性模式，真模型约 50 秒出结果）…');
   tlEl = null;
 
+  await ensureToken();
+
   try {
     var resp;
     if (imageBase64) {
@@ -389,11 +426,15 @@ async function startHttp(prebuiltReq) {
       var fd = new FormData();
       fd.append('payload', JSON.stringify(req));
       fd.append('image', blob, 'capture.jpg');
-      resp = await fetch(url, { method: 'POST', body: fd });
+      fd.append('requestId', 'web-' + Date.now() + '-' + Math.floor(Math.random()*0xFFFF));
+      resp = await fetch(url, { method: 'POST', headers: authHeaders(), body: fd });
     } else {
+      var reqBody = Object.assign({}, req, {
+        requestId: req.requestId || ('web-' + Date.now() + '-' + Math.floor(Math.random()*0xFFFF))
+      });
       resp = await fetch(url, {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(req)
+        method: 'POST', headers: authHeaders({'Content-Type':'application/json'}),
+        body: JSON.stringify(reqBody)
       });
     }
     var j = await resp.json();

@@ -112,6 +112,8 @@ class InspectResp(BaseModel):
     workOrderId: Optional[str] = None
     needHuman: bool = False
     mock: bool = False
+    # 🟢 P0-4: 幂等命中（同一 requestId 重复提交时为 true，直接返回已有结果）
+    duplicate: bool = False
     durationMs: int = 0
     # 反问：当信息不全时，Agent 追问这些问题，端侧弹 Dialog 让用户补答
     followUpQuestions: list[str] = []

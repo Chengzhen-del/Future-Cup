@@ -7,7 +7,7 @@
 """
 import json
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 
 from app.agent.state_machine import run_once
 from app.schemas import InspectReq, InspectResp
@@ -18,15 +18,45 @@ router = APIRouter(tags=["inspections"])
 MAX_IMAGE_MB = 10
 
 
+def _rebuild_resp(d: dict) -> InspectResp:
+    """幂等命中：把库里已有记录重建成与首次提交相同的 InspectResp。"""
+    return InspectResp(
+        sessionId="",
+        inspectionId=d.get("id", ""),
+        imageUrl=f"/media/{d['imageId']}" if d.get("imageId") else "",
+        level=d.get("level") or "正常",
+        confidence=float(d.get("confidence") or 0.0),
+        advice=d.get("advice") or "",
+        findings=d.get("findings") or [],
+        voiceSlots=d.get("voiceSlots") or {},
+        vision=d.get("vision") or {},
+        steps=d.get("steps") or [],
+        workOrderId=d.get("workOrderId") or None,
+        needHuman=bool(d.get("needHuman")),
+        mock=bool(d.get("mock")),
+        durationMs=int(d.get("durationMs") or 0),
+        duplicate=True,
+    )
+
+
 @router.post("/inspections/upload", response_model=InspectResp,
              summary="上传巡检数据（推荐，multipart 带图）")
 async def upload(image: UploadFile | None = File(None),
                  audio: UploadFile | None = File(None),
-                 payload: str = Form("{}")):
+                 payload: str = Form("{}"),
+                 requestId: str = Form(""),
+                 idempotency_key: str = Header("", alias="Idempotency-Key")):
     try:
         req = InspectReq(**json.loads(payload or "{}"))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"payload 解析失败: {e}")
+
+    # 🟢 P0-4: 幂等键——同一次提交重传（弱网重试）直接返回已有结果，不重复落库
+    rid = (requestId or idempotency_key or "").strip()
+    if rid:
+        existed = store.get_inspection_by_request_id(rid)
+        if existed:
+            return _rebuild_resp(existed)
 
     image_bytes = b""
     if image is not None:
@@ -34,7 +64,7 @@ async def upload(image: UploadFile | None = File(None),
         if len(image_bytes) > MAX_IMAGE_MB * 1024 * 1024:
             raise HTTPException(status_code=413, detail="图片超过 10MB")
     # audio：初赛「录音留证不转写」，此处接收不处理（媒体归档后续补）
-    return await run_once(req, image_bytes)
+    return await run_once(req, image_bytes, rid)
 
 
 @router.post("/inspections", response_model=InspectResp, summary="纯 JSON 上报（无图）")

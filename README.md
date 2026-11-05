@@ -134,7 +134,7 @@ inspectagent-cloud/
 │     ├─ llm.py               DeepSeek 封装（chat / chat_json / tool_loop / stream）
 │     ├─ vision.py            Qwen-VL 封装（4 个视觉工具）
 │     ├─ rag.py               Chroma 检索 + 关键词兜底 + 记忆索引
-│     └─ store.py             SQLite（14 张表 / v5 迁移 / 归档 / 统计）
+│     └─ store.py             SQLite（15 张表 / v6 迁移 / 归档 / 统计）
 ├─ knowledge/rules.md         RAG 语料（110 条）
 ├─ web/                       豆包风格测试台（纯静态，无内联脚本）
 ├─ scripts/
@@ -415,7 +415,7 @@ python scripts\test_llm.py     # 模型连通性自检
 | 文档 | 内容 |
 |---|---|
 | [交付说明.md](交付说明.md) | **给端侧的一页纸**：起服务、联调 5 步、演示前检查、已知限制 |
-| [docs/api.md](docs/api.md) | 30 个接口的 method / path / 参数 / 返回 / 示例 |
-| [docs/database.md](docs/database.md) | 14 张表字段级设计、索引、ER 关系、生命周期 |
+| [docs/api.md](docs/api.md) | 36 个接口的 method / path / 参数 / 返回 / 示例 |
+| [docs/database.md](docs/database.md) | 15 张表字段级设计、索引、ER 关系、生命周期 |
 | `D:\d\Huawei_project\docs\端侧开发任务表.md` | 端侧单人从零实施路线 / 接口缺口 / 验收门槛 |
 | `d:\d\未来杯\智巡InspectAgent_数据与接口总体规划.md` | 全局主纲（冲突时以主纲为准） |

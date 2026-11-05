@@ -11,7 +11,9 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.agent.state_machine import InspectAgent
+from app.config import settings
 from app.schemas import InspectReq
+from app.services import store
 
 router = APIRouter(tags=["agent"])
 log = logging.getLogger("inspectagent.ws")
@@ -20,6 +22,13 @@ log = logging.getLogger("inspectagent.ws")
 @router.websocket("/ws/agent/{session_id}")
 async def agent_ws(ws: WebSocket, session_id: str):
     await ws.accept()
+    if settings.AUTH_ENABLED:
+        info = store.verify_token(ws.query_params.get("token", ""))
+        if not info:
+            await ws.send_json({"type": "error", "code": "UNAUTHORIZED",
+                                "message": "token 无效，请先登录再连 WS"})
+            await ws.close(code=4401)
+            return
     log.info("WS 连接建立: %s", session_id)
     try:
         while True:

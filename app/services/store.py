@@ -481,6 +481,8 @@ def _load_checklist(raw: str | None) -> list[dict]:
 def _task_item(r: sqlite3.Row) -> TaskItem:
     d = dict(r)
     checklist = _load_checklist(d.pop("checklistJson", None))
+    if not d.get("inspectionId"):
+        d["inspectionId"] = ""
     d["checklist"] = checklist
     d["checklistTotal"] = len(checklist)
     d["checklistDone"] = sum(1 for x in checklist if x.get("status") in ("done", "skipped"))

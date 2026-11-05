@@ -414,3 +414,78 @@ Body 直接是 `InspectReq`。
 2. 新增字段一律**可选**（给默认值），不许把已有必填字段改没
 3. 云端未完成前返回**结构正确的假数据**，字段一个都不能少
 4. 新增表 / 端点需同时更新 `docs/database.md` 与第 0 节总表
+
+---
+
+## 11. v6 变更（P0 端侧优化，2026-11）
+
+> **鉴权默认开启**：`AUTH_ENABLED=1` 时，除登录/刷新外的所有 `/api/v1/*` 都必须带
+> `Authorization: Bearer <accessToken>`；WS 用 `?token=<accessToken>`。
+> 关闭鉴权：`.env` 设 `AUTH_ENABLED=0` 并重启。
+
+### 11.1 登录鉴权（新增 4 个端点）
+
+| 方法 | 路径 | 请求 | 返回 |
+|---|---|---|---|
+| POST | `/api/v1/auth/login` | `{username, password}` | `TokenPair` |
+| POST | `/api/v1/auth/refresh` | `{refreshToken}` | `TokenPair` |
+| POST | `/api/v1/auth/logout` | Header Bearer | `{ok: true}` |
+| GET | `/api/v1/auth/me` | Header Bearer | `UserInfo` |
+
+`TokenPair`：
+
+```json
+{
+  "accessToken": "…",
+  "refreshToken": "…",
+  "tokenType": "Bearer",
+  "expiresIn": 7200,
+  "user": {"userId": "U-0001", "name": "admin", "role": "admin", "team": "运维中心"}
+}
+```
+
+- `expiresIn` 单位秒（默认 120 分钟）；refresh 默认 7 天
+- token 落库，**服务重启后仍有效**；logout 只吊销当前 access token
+- 默认账号（首次建库自动写入）：`admin/admin123`、`inspector/inspector123`
+- 401 响应：`{"detail":{"code":"UNAUTHORIZED","message":"未登录或 token 已失效"}}`
+
+端侧处理：启动时若无 token → 登录页；收到 401 → 用 refreshToken 换新 access；refresh 也 401 → 回登录页。
+
+### 11.2 检查项模板（新增 2 个端点）
+
+| 方法 | 路径 | 返回 |
+|---|---|---|
+| GET | `/api/v1/device-types` | `[{deviceType, items[]}]`（6 类设备） |
+| GET | `/api/v1/device-types/{deviceType}/checklist` | `{deviceType, items[]}` |
+
+`items[]` 元素：`{key, name, required, status}`，`status` ∈ `pending / done / skipped`。
+未知设备类型返回 404。
+
+### 11.3 任务新增字段（`GET /tasks`、`GET /tasks/{id}`、`PATCH /tasks/{id}/status` 均返回）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `checklist` | array | 检查项，`[{key,name,required,status}]`，默认 6 项 |
+| `checklistTotal` | int | 总项数 |
+| `checklistDone` | int | 已完成项数（`done` 或 `skipped`） |
+| `inspectionId` | string | 该任务对应巡检记录，未巡检为 `""` |
+| `isCurrent` | bool | 是否为当前任务（同一 assignee 唯一进行中） |
+
+**服务端强约束**：把某任务置为 `进行中` 时，同 `assignee` 的其他进行中任务自动回到 `待巡检`；
+置为 `已完成` 时 `checklist` 全部标记 `done`，并可回传 `inspectionId`。
+
+端侧处理：任务卡进度直接用 `checklistDone/checklistTotal`，不要再本地推导"当前任务"。
+
+### 11.4 上传幂等（`POST /inspections/upload`）
+
+新增可选表单字段 `requestId`（或请求头 `Idempotency-Key`）：
+
+- 同一 `requestId` 重复提交 → **不新建记录**，直接返回首次结果，并带 `"duplicate": true`
+- 首次耗时正常（约 2 分钟），重复提交毫秒级返回
+- 建议端侧用 `deviceId + 时间戳` 生成，弱网重试时复用同一个值
+
+`InspectResp` 新增字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `duplicate` | bool | true 表示命中幂等、返回的是已有记录 |

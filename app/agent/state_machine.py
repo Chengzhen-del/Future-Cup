@@ -101,9 +101,11 @@ def _has_conflict(vdata: dict, vc: VoiceOut) -> bool:
 
 
 class InspectAgent:
-    def __init__(self, req: InspectReq, image_bytes: bytes = b""):
+    def __init__(self, req: InspectReq, image_bytes: bytes = b"",
+                 request_id: str = ""):
         self.req = req
         self.image_bytes = image_bytes
+        self.request_id = request_id
         self.session_id = uuid.uuid4().hex[:12]
         self.steps: list[StepOut] = []
         self.findings: list[Finding] = []
@@ -659,7 +661,8 @@ class InspectAgent:
                            memories=self._ctx.get("historyMemories", []))
 
         if not settings.mock_mode:
-            resp = store.finalize_inspection(self.req, resp, self.image_bytes)
+            resp = store.finalize_inspection(self.req, resp, self.image_bytes,
+                                             self.request_id)
             # ========== P0 记忆落库 ==========
             try:
                 store.upsert_session(self.session_id, self.req)
@@ -686,9 +689,10 @@ class InspectAgent:
         yield {"type": "final", "data": resp.model_dump()}
 
 
-async def run_once(req: InspectReq, image_bytes: bytes = b"") -> InspectResp:
+async def run_once(req: InspectReq, image_bytes: bytes = b"",
+                   request_id: str = "") -> InspectResp:
     """HTTP 一次性调用（不走 WS）。"""
-    agent = InspectAgent(req, image_bytes)
+    agent = InspectAgent(req, image_bytes, request_id)
     final: dict = {}
     # 🟢 P3-1: Trace buffer - async for 消费时同时收集
     trace_events: list[dict] = []

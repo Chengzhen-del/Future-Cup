@@ -306,3 +306,47 @@ sequenceDiagram
 2. 补一条 `INSERT INTO schema_version VALUES(N)`
 3. 同步本文档与 `docs/api.md` 的响应字段
 4. 索引命名统一 `idx_<表缩写>_<字段>`
+
+---
+
+## 6. v6 迁移（P0 端侧优化，2026-11）
+
+表数量由 **14 增至 15**（新增 `auth_tokens`）。
+
+### 6.1 变更字段
+
+| 表 | 字段 | 类型 | 说明 |
+|---|---|---|---|
+| `tasks` | `checklistJson` | TEXT | 检查项 JSON 数组，6 项，元素 `{key,name,required,status}` |
+| `inspections` | `requestId` | TEXT | 端侧幂等键，空串不参与唯一约束 |
+| `users` | `passwordHash` | TEXT | `pbkdf2$120000$<salt>$<hex>`，标准库实现，无额外依赖 |
+
+### 6.2 新增表 `auth_tokens`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `token` | TEXT | PK | `secrets.token_urlsafe(32)` |
+| `userId` | TEXT | — | 关联 `users.id` |
+| `kind` | TEXT | — | `access` / `refresh` |
+| `expiresAt` | TEXT | — | `YYYY-MM-DD HH:mm:ss`，字符串可直接比较 |
+| `revoked` | INTEGER | 默认 0 | 1 = 已吊销 |
+| `createdAt` | TEXT | — | 签发时间 |
+
+索引：`idx_auth_user(userId)`；`idx_insp_reqid(inspections.requestId) WHERE requestId <> ''`（部分唯一索引，允许多条空串）。
+
+### 6.3 迁移时自动完成
+
+1. `ALTER TABLE` 加上述三列
+2. 建 `auth_tokens` 表与两个索引
+3. 写入默认账号 `admin/admin123`、`inspector/inspector123`
+4. 给所有历史任务按设备类型补 `checklistJson`
+
+### 6.4 写入时机
+
+| 动作 | 写入 |
+|---|---|
+| 登录成功 | `auth_tokens` 两条（access + refresh），`users.lastLoginAt` 更新 |
+| 退出 | 对应 access token `revoked=1` |
+| 上传（带 requestId） | `inspections.requestId` 落库；重复请求不写 |
+| 任务置进行中 | 同 assignee 其他进行中任务 `status='待巡检'` |
+| 任务置已完成 | `checklistJson` 全部 `done`，回填 `inspectionId` |

@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
-from app.schemas import DeviceProfile, ServerConfig, TaskItem
+from app.schemas import DeviceChecklist, DeviceProfile, ServerConfig, TaskItem
 from app.services import store
 
 router = APIRouter(tags=["tasks"])
@@ -49,6 +49,21 @@ def task_status(task_id: str, body: TaskStatusPatch):
     if not t:
         raise HTTPException(status_code=404, detail="任务不存在")
     return t
+
+
+@router.get("/device-types", summary="设备类型与检查项模板")
+def device_types():
+    return [{"deviceType": t, "items": store._default_checklist(t)}
+            for t in store.CHECKLIST_TEMPLATES]
+
+
+@router.get("/device-types/{device_type}/checklist", response_model=DeviceChecklist,
+            summary="检查项模板（按设备类型）")
+def device_type_checklist(device_type: str):
+    if device_type not in store.CHECKLIST_TEMPLATES:
+        raise HTTPException(status_code=404, detail="未知设备类型")
+    return DeviceChecklist(deviceType=device_type,
+                           items=store._default_checklist(device_type))
 
 
 @router.get("/devices", response_model=list[DeviceProfile], summary="设备台账列表")
