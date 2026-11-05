@@ -3,7 +3,7 @@
 字段全链路 camelCase；DB 列名、JSON key、ArkTS 字段三者同名。改字段三步：本文件 → 主纲 §3/§7 → 端侧 ets/model/。
 """
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Level = Literal["正常", "关注", "异常", "紧急"]
 StepStatus = Literal["pending", "running", "done", "failed"]
@@ -121,6 +121,15 @@ class InspectResp(BaseModel):
     incompleteFields: list[str] = []
     # 🧠 命中的历史巡检记忆（让端侧/HTTP 模式也能展示"我记得上次..."）
     memories: list[dict] = []
+    # 🟢 P1-10/11: 报告页稳定字段——历史详情与 WS final 共用同一 DTO
+    imageAbsoluteUrl: str = ""      # 图片完整可访问地址（PUBLIC_BASE_URL 或请求来源 + imageUrl）
+    taskId: str = ""
+    deviceId: str = ""
+    deviceName: str = ""
+    location: str = ""
+    operator: str = ""
+    capturedAt: str = ""
+    voiceText: str = ""
 
 
 class TaskItem(BaseModel):
@@ -140,6 +149,8 @@ class TaskItem(BaseModel):
     inspectionId: str = ""
     # 🟢 P0-2: 同一 assignee 当前唯一进行中任务为 true
     isCurrent: bool = False
+    # 🟢 P1-7: 服务端版本时间（冲突上报时的 cloud_version）
+    updatedAt: str = ""
 
 
 class ChecklistItem(BaseModel):
@@ -200,6 +211,8 @@ class WorkOrder(BaseModel):
     handleNote: str = ""
     createdAt: str = ""
     closedAt: str = ""
+    # 🟢 P1-7: 服务端版本时间（冲突上报时的 cloud_version）
+    updatedAt: str = ""
 
 
 class ServerConfig(BaseModel):
@@ -210,3 +223,116 @@ class ServerConfig(BaseModel):
     llm: bool = False
     vision: bool = False
     serverTime: str = ""
+
+
+# ================= P1-6: 同步快照固定 DTO =================
+class SyncInspection(BaseModel):
+    """增量同步用的巡检摘要（不含 findings / steps，避免快照过大）。
+
+    需要详情时再调 GET /inspections/{id}，返回结构与 WS final 完全一致。
+    """
+    inspectionId: str
+    taskId: str = ""
+    deviceId: str = ""
+    deviceName: str = ""
+    location: str = ""
+    operator: str = ""
+    level: Level = "正常"
+    confidence: float = 0.0
+    advice: str = ""
+    imageUrl: str = ""
+    imageAbsoluteUrl: str = ""
+    workOrderId: str = ""
+    capturedAt: str = ""
+    createdAt: str = ""
+    updatedAt: str = ""
+    needHuman: bool = False
+    mock: bool = False
+
+
+class SyncSnapshot(BaseModel):
+    since: str = ""
+    sinceField: str = "updatedAt"      # 增量依据：updatedAt（服务端版本时间）
+    serverTime: str = ""               # 客户端下次把这个值回传作 since
+    devices: list[DeviceProfile] = []
+    tasks: list[TaskItem] = []
+    workorders: list[WorkOrder] = []
+    inspections: list[SyncInspection] = []
+    deleted: list[dict] = []           # 预留删除墓碑；当前无删除接口，恒为空
+
+
+# ================= P1-7: 冲突仲裁 =================
+class ConflictReq(BaseModel):
+    """端侧冲突上报。兼容 snake_case 旧字段名（device_version 等）。"""
+    model_config = ConfigDict(populate_by_name=True)
+
+    table: Literal["inspections", "workorders", "tasks"]
+    id: str
+    deviceVersion: str = Field("", alias="device_version")
+    cloudVersion: str = Field("", alias="cloud_version")
+    deviceChanges: dict = Field(default_factory=dict, alias="device_changes")
+
+
+class ConflictResp(BaseModel):
+    table: str
+    id: str
+    resolved: bool = True
+    winner: Literal["cloud", "device"] = "cloud"
+    cloudVersion: str = ""
+    applied: list[str] = []
+    rejected: list[str] = []
+    final: dict = {}
+    message: str = ""
+
+
+# ================= P2-13: Trace 事件结构 =================
+class TraceEvent(BaseModel):
+    seq: int
+    type: str
+    timestamp: str = ""
+    stepName: str = ""
+    payload: dict = {}
+
+
+class TraceDetail(BaseModel):
+    id: int
+    sessionId: str = ""
+    inspectionId: str = ""
+    taskId: str = ""
+    deviceId: str = ""
+    deviceName: str = ""
+    level: str = ""
+    confidence: float = 0.0
+    durationMs: int = 0
+    createdAt: str = ""
+    eventCount: int = 0
+    events: list[TraceEvent] = []
+
+
+# ================= P2-14: 告警处理信息 =================
+class AlertItem(BaseModel):
+    id: int
+    level: str = ""
+    category: str = ""
+    message: str = ""
+    detail: str = ""
+    resolved: bool = False
+    resolvedBy: str = ""
+    resolvedAt: str = ""
+    resolveNote: str = ""
+    createdAt: str = ""
+
+
+class AlertResolveReq(BaseModel):
+    note: str = ""
+
+
+# ================= P1-12: 媒体生命周期 =================
+class MediaPolicy(BaseModel):
+    urlRule: str = "imageUrl 为 /media/{fileName}；imageAbsoluteUrl 为完整地址（可直接加载）"
+    retentionDays: int = 90
+    keepFailedUploads: bool = False
+    thumbnailSupported: bool = False
+    pdfExportSupported: bool = False
+    deleteWithInspection: bool = True
+    note: str = ""

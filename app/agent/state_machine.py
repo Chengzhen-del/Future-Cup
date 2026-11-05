@@ -658,7 +658,15 @@ class InspectAgent:
                            durationMs=duration_ms,
                            followUpQuestions=follow_ups,
                            incompleteFields=incomplete,
-                           memories=self._ctx.get("historyMemories", []))
+                           memories=self._ctx.get("historyMemories", []),
+                           # P1-11: 报告页稳定字段（历史详情同一 DTO）
+                           taskId=self.req.taskId,
+                           deviceId=self.req.deviceId,
+                           deviceName=self.req.deviceName,
+                           location=self.req.location,
+                           operator=self.req.operator,
+                           capturedAt=self.req.capturedAt,
+                           voiceText=self.req.voiceText)
 
         if not settings.mock_mode:
             resp = store.finalize_inspection(self.req, resp, self.image_bytes,

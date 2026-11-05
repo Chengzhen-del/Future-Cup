@@ -11,7 +11,7 @@
 
 ## 0. 接口总表
 
-共 **30** 个端点（含静态资源与 WS）。
+共 **37** 个端点（含静态资源与 WS）。
 
 | # | 方法 | 路径 | 用途 | 端侧调用 |
 |---|---|---|---|---|
@@ -45,6 +45,13 @@
 | 28 | GET | `/api/v1/stats/tokens` | Token 用量 / 成本 | 新增：运维页 |
 | 29 | GET | `/api/v1/sync/snapshot` | 端侧全量 / 增量同步 | 新增：启动时 |
 | 30 | POST | `/api/v1/sync/conflict` | 冲突仲裁 | 新增：同步 |
+| 31 | POST | `/api/v1/auth/login` | 登录换 token | 启动时 |
+| 32 | POST | `/api/v1/auth/refresh` | 刷新 token | 401 时 |
+| 33 | POST | `/api/v1/auth/logout` | 登出 | 我的页 |
+| 34 | GET | `/api/v1/auth/me` | 当前用户 | 我的页 |
+| 35 | GET | `/api/v1/device-types` | 设备类型 + 检查项模板 | 任务页 |
+| 36 | GET | `/api/v1/device-types/{deviceType}/checklist` | 单类型检查项模板 | 任务页 |
+| 37 | GET | `/api/v1/system/media-policy` | 媒体生命周期策略 | 运维 |
 
 图例：**端侧调用**列中标注"新增"的，表示端侧 `HttpService.ets` 目前尚未封装。
 
@@ -73,7 +80,12 @@
 
 ## 2. 任务 / 设备 / 工单
 
-### `GET /api/v1/tasks` → `TaskItem[]`
+### `GET /api/v1/tasks` → `TaskItem[]` 或分页信封
+
+可选参数：`page`、`pageSize`（默认 20，上限 200）、`status`、`deviceId`。
+
+- 不传 `page` → 返回数组（旧客户端零改动）
+- 传 `page` → `{ "items": [...], "total": 6, "page": 1, "pageSize": 20 }`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -85,8 +97,10 @@
 | priority | string | 高 / 中 / 低 |
 | deadline | string | 截止日期 |
 | assignee | string | 指派人 |
+| updatedAt | string | 服务端版本时间（冲突上报时填 `cloud_version`） |
+| checklist / checklistTotal / checklistDone / inspectionId / isCurrent | — | v6 新增，见 11.3 |
 
-`GET /api/v1/tasks/{taskId}` 返回单个；不存在 → 404。
+`GET /api/v1/tasks/{taskId}` 返回单个；不存在 → 404（统一错误结构，见第 9 节）。
 
 `PATCH /api/v1/tasks/{taskId}/status`
 
@@ -94,7 +108,9 @@
 { "status": "已完成", "inspectionId": "IN-20261104-f980" }
 ```
 
-### `GET /api/v1/devices` → `DeviceProfile[]`
+### `GET /api/v1/devices` → `DeviceProfile[]` 或分页信封
+
+可选参数：`page`、`pageSize`、`type`（如 `低压配电柜`）。
 
 ```json
 { "id": "D-3001", "name": "1号低压配电柜", "type": "低压配电柜",
@@ -105,7 +121,9 @@
 
 `GET /api/v1/devices/{deviceId}` 返回单个；设备不存在返回空档案（不 404）。
 
-### `GET /api/v1/workorders` → `WorkOrder[]`
+### `GET /api/v1/workorders` → `WorkOrder[]` 或分页信封
+
+可选参数：`page`、`pageSize`、`status`、`level`、`deviceId`。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -117,6 +135,7 @@
 | status | string | 待处理 / 处理中 / 已闭环 |
 | handleNote | string | 处理说明 |
 | createdAt / closedAt | string | 时间 |
+| updatedAt | string | 服务端版本时间（冲突上报时填 `cloud_version`） |
 
 `PATCH /api/v1/workorders/{woId}/status`
 
@@ -225,13 +244,26 @@ Body 直接是 `InspectReq`。
 
 ### `GET /api/v1/inspections?limit=50`
 
-返回列表（不含 `steps` / `findings` / `memories` 展开），字段：
-`id, taskId, deviceId, deviceName, location, operator, voiceText, voiceSlotsJson, visionJson, sensorJson, imageId, level`
+可选参数：`page`、`pageSize`、`level`、`deviceId`、`startTime`、`endTime`（时间字符串，含边界）。
+不传 `page` 返回数组，传了返回 `{items,total,page,pageSize}`。
+
+返回 **`SyncInspection` 摘要 DTO**（与同步快照同一结构，不含 findings / steps）：
+
+```json
+{ "inspectionId": "IN-20261105-5c8e", "taskId": "T-1001", "deviceId": "D-0001",
+  "deviceName": "低压配电柜", "location": "配电房A", "operator": "王工",
+  "level": "紧急", "confidence": 0.47, "advice": "...",
+  "imageUrl": "/media/20261105_093803_f9eb47.jpg",
+  "imageAbsoluteUrl": "http://192.168.1.10:8000/media/20261105_093803_f9eb47.jpg",
+  "workOrderId": "WO-9F2A1C", "capturedAt": "...", "createdAt": "...",
+  "updatedAt": "...", "needHuman": true, "mock": false }
+```
 
 ### `GET /api/v1/inspections/{inspectionId}`
 
-返回详情，在列表字段基础上追加：
-`confidence, advice, needHuman, mock, stepsJson, workOrderId, durationMs, capturedAt, createdAt, findings, voiceSlots, vision, steps, followUpQuestions, incompleteFields, memories`
+返回 **`InspectResp`（与 WS `final` 完全同一个 DTO）**，见第 3 节响应定义。
+额外稳定字段：`taskId / deviceId / deviceName / location / operator / capturedAt / voiceText /
+imageUrl / imageAbsoluteUrl`，端侧报告页可直接绑定，无需再猜字段名。
 
 `step` 元素字段为 `name / status / detail / durationMs / subSteps`（**没有 step / title 字段**）。
 
@@ -297,15 +329,28 @@ Body 直接是 `InspectReq`。
 
 ### `GET /api/v1/traces?deviceId=D-3001&limit=20`
 
+可选参数：`deviceId`、`level`、`startTime`、`endTime`、`page`、`pageSize`、`limit`。
+
 ```json
 { "traces": [ { "id": 5, "sessionId": "a1b2c3d4", "inspectionId": "IN-20261104-f980",
                 "deviceId": "D-3001", "deviceName": "1号低压配电柜", "level": "紧急",
-                "confidence": 0.47, "durationMs": 117500, "createdAt": "2026-11-04 16:31:00" } ] }
+                "confidence": 0.47, "durationMs": 117500, "createdAt": "2026-11-04 16:31:00" } ],
+  "total": 5, "page": 1, "pageSize": 20 }
 ```
 
 ### `GET /api/v1/traces/{traceId}`
 
-在列表字段基础上追加 `events`（**完整事件流数组**，可直接按帧回放；DB 里存为 `eventsJson`，出参已解析为 `events`）。
+```json
+{ "id": 5, "eventCount": 120, "events": [
+  { "seq": 1, "type": "sub_step", "timestamp": "2026-11-04 16:31:00",
+    "stepName": "任务规划", "payload": { "text": "🔍 命中 3 条历史巡检记忆" } },
+  { "seq": 2, "type": "step", "timestamp": "2026-11-04 16:31:00",
+    "stepName": "任务规划", "payload": { "name": "任务规划", "status": "running" } } ] }
+```
+
+事件已标准化为 `{seq, type, timestamp, stepName, payload}`：`seq` 单调递增可排序回放；
+`type` ∈ `step / sub_step / token / memory_hit / final / error`；`payload` 为原事件载荷
+（旧数据自动兼容映射，无需端侧区分新旧）。
 
 ### `POST /api/v1/admin/archive?days=90`
 
@@ -323,13 +368,26 @@ Body 直接是 `InspectReq`。
 
 ### `GET /api/v1/alerts?unresolved=true&limit=50`
 
+可选参数：`level`、`category`、`startTime`、`endTime`、`page`、`pageSize`。
+
 ```json
 { "alerts": [ { "id": 7, "level": "warn", "category": "rag",
                 "message": "Chroma 向量检索不可用，已退化关键词兜底",
-                "detail": "...", "resolved": 0, "createdAt": "2026-11-04 16:20:00" } ] }
+                "detail": "...", "resolved": false, "resolvedBy": "", "resolvedAt": "",
+                "resolveNote": "", "createdAt": "2026-11-04 16:20:00" } ],
+  "total": 2, "page": 1, "pageSize": 20 }
 ```
 
-### `POST /api/v1/alerts/{alertId}/resolve` → `{"ok": true}`
+### `POST /api/v1/alerts/{alertId}/resolve`
+
+请求体（可选）：`{ "note": "已到现场处理" }`
+
+```json
+{ "ok": true, "alert": { "id": 7, "resolved": true, "resolvedBy": "U-0001",
+                         "resolvedAt": "2026-11-05 10:00:24", "resolveNote": "已到现场处理" } }
+```
+
+`resolvedBy` 取自当前登录 token 的 userId，非前端传参。
 
 ### `GET /api/v1/stats/tokens?days=7`
 
@@ -339,10 +397,14 @@ Body 直接是 `InspectReq`。
              "totalTokens": 35169, "costCny": 0.1697, "calls": 22 },
   "byDay":    [ { "day": "2026-11-04", "tokens": 35169, "cost": 0.1697, "calls": 22 } ],
   "byCaller": [ { "caller": "react", "tokens": 11795, "cost": 0.07, "calls": 6 } ],
-  "byModel":  [ { "model": "deepseek-v4-pro-ga-260813", "tokens": 29644, "cost": 0.09, "calls": 20 } ] }
+  "byModel":  [ { "model": "deepseek-v4-pro-ga-260813", "tokens": 29644, "cost": 0.09, "calls": 20 } ],
+  "byUser":   [ { "userId": "U-0001", "tokens": 12000, "cost": 0.05, "calls": 8 } ],
+  "byDevice": [ { "deviceId": "D-3001", "tokens": 9000, "cost": 0.04, "calls": 6 } ],
+  "bySession":[ { "sessionId": "a1b2c3d4", "tokens": 9000, "cost": 0.04, "calls": 6 } ] }
 ```
 
 `caller` 取值：`plan` / `decide` / `react` / `review` / `followup` / `voice` / `vision` / `stream`。
+`userId` / `deviceId` 由 `sessionId` 反查填入；老数据可能为空串。
 
 ---
 
@@ -353,30 +415,71 @@ Body 直接是 `InspectReq`。
 端侧 App 启动拉一次全量；之后带 `since` 做增量。
 
 ```json
-{ "devices": [...], "tasks": [...], "inspections": [...], "workorders": [...],
-  "syncAt": "2026-11-04 16:35:00", "since": "2026-11-01 00:00:00" }
+{ "since": "2026-11-01 00:00:00", "sinceField": "updatedAt",
+  "serverTime": "2026-11-05 09:58:54",
+  "devices": [...], "tasks": [...], "workorders": [...],
+  "inspections": [ /* SyncInspection 摘要，见 3.4 */ ],
+  "deleted": [] }
 ```
 
-| 参数 | 说明 |
+| 参数 / 字段 | 说明 |
 |---|---|
-| since | 可选；按 `inspections.capturedAt` / `workorders.createdAt` ≥ since 过滤 |
+| since | 可选；**统一按 `updatedAt > since`** 过滤（tasks / workorders / inspections 三张表同一规则） |
+| sinceField | 固定 `updatedAt`，明确版本依据，不再混用 capturedAt / createdAt |
+| serverTime | 客户端存下来作为**下一次** `since`（不是本地时间，避免时钟漂移漏数据） |
+| deleted | 预留删除墓碑数组，当前无删除接口，恒为空 |
 | 上限 | 每类最多 5000 条 |
+
+`inspections` 固定为 `SyncInspection` 摘要（不含 findings / steps），详情走
+`GET /inspections/{id}`。空 `since` = 全量；非空 = 增量。
 
 ### `POST /api/v1/sync/conflict`
 
+请求（驼峰与下划线都接受）：
+
 ```json
 { "table": "inspections", "id": "IN-xxx",
-  "device_version": "2026-11-04 16:00:00", "cloud_version": "2026-11-04 16:05:00",
+  "device_version": "2026-11-05 09:59:00", "cloud_version": "2026-11-05 09:59:00",
   "device_changes": { "level": "关注" } }
 ```
+
+`table` 只能是 `inspections / workorders / tasks`。字段白名单：
+
+| table | 允许端侧改的字段 |
+|---|---|
+| inspections | `level, confidence, advice, needHuman` |
+| workorders | `status, handleNote, assignee` |
+| tasks | `status, inspectionId` |
 
 响应：
 
 ```json
-{ "resolved": true, "winner": "cloud", "message": "默认云端优先" }
+{ "resolved": true, "winner": "device", "cloudVersion": "2026-11-05 10:01:00",
+  "applied": ["level"], "rejected": ["foo"], "final": { /* 最新完整记录 */ }, "message": "" }
 ```
 
-当前策略：**云端优先**（简化实现）。端侧收到 `winner: "cloud"` 时用 `final` 覆盖本地副本。
+仲裁规则：
+
+1. 非白名单字段一律进 `rejected`，不落库；
+2. `cloud_version` == 服务端当前 `updatedAt` → 云端没被别人改过，接受端侧改动（`winner=device`）；
+3. 否则云端记录已变更，以云端为准（`winner=cloud`，`applied=[]`）；
+4. 记录不存在 → `resolved=false`，`winner=cloud`。
+
+端侧统一用 `final` 覆盖本地副本，并用响应里的 `cloudVersion` 更新本地版本号。
+
+### `GET /api/v1/system/media-policy`
+
+```json
+{ "urlRule": "imageUrl 为 /media/{fileName}，imageAbsoluteUrl 为完整地址",
+  "retentionDays": 90, "keepFailedUploads": false,
+  "thumbnailSupported": false, "pdfExportSupported": false,
+  "deleteWithInspection": true, "note": "..." }
+```
+
+媒体生命周期统一策略：原图/录音保留 `MEDIA_RETENTION_DAYS`（默认 90 天），
+随归档一并清理；巡检删除时同步删除 media 登记；当前不提供缩略图与 PDF 导出。
+`imageUrl` 始终是相对路径（不变），跨网访问请读 `imageAbsoluteUrl`（绝对地址，
+基址优先取 `PUBLIC_BASE_URL` 环境变量，其次取请求来源）。
 
 ---
 
@@ -396,15 +499,25 @@ Body 直接是 `InspectReq`。
 
 ---
 
-## 9. 错误码
+## 9. 错误码（v7 起统一结构）
 
-| code | 含义 | 端侧处理 |
-|---|---|---|
-| 400 | `payload` JSON 解析失败 | 检查字符串是否转义正确 |
-| 404 | 任务 / 设备 / 工单 / 巡检 / Trace 不存在 | 提示并回列表 |
-| 413 | 图片 > 10MB | 先压缩到长边 ≤1280 再传 |
-| 422 | 请求体字段类型不符（Pydantic 校验） | 按 `/docs` 的定义修正 |
-| 500 | 云端异常 | 提示"服务暂时不可用"，保留本地缓存 |
+所有错误（含中间件 401、参数校验 422、未捕获 500）返回**同一个结构**：
+
+```json
+{ "code": "NOT_FOUND", "message": "巡检记录不存在", "detail": "", "traceId": "e52a9caac6c3430a" }
+```
+
+响应头同时带 `X-Trace-Id`，与服务端日志一致，报障时直接把 `traceId` 发给云端即可定位。
+
+| HTTP | code | 含义 | 端侧处理 |
+|---|---|---|---|
+| 400 | `BAD_REQUEST` | `payload` JSON 解析失败 | 检查字符串是否转义正确 |
+| 401 | `UNAUTHORIZED` | 未登录 / token 过期 | 用 refreshToken 换新 token，失败则跳登录 |
+| 403 | `FORBIDDEN` | 无权限 | 提示无权限 |
+| 404 | `NOT_FOUND` | 任务 / 设备 / 工单 / 巡检 / Trace / 告警不存在 | 提示并回列表 |
+| 413 | `PAYLOAD_TOO_LARGE` | 图片 > 10MB | 先压缩到长边 ≤1280 再传 |
+| 422 | `VALIDATION_ERROR` | 请求体字段类型不符（Pydantic 校验） | 按 `/docs` 的定义修正，`detail` 里有具体字段 |
+| 500 | `INTERNAL_ERROR` | 云端异常 | 提示"服务暂时不可用"，保留本地缓存，带 `traceId` 反馈 |
 
 ---
 
@@ -489,3 +602,37 @@ Body 直接是 `InspectReq`。
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `duplicate` | bool | true 表示命中幂等、返回的是已有记录 |
+
+---
+
+## 12. v7 变更（P1 / P2 端侧优化，2026-11）
+
+> 本次不新增鉴权逻辑，只补契约稳定性与生产可运维性。所有字段均为**新增可选**，老端侧不改也能跑。
+
+### 12.1 契约稳定化
+
+| 编号 | 改动 | 端侧影响 |
+|---|---|---|
+| P1-6 | 同步快照 `inspections` 固定为 `SyncInspection` 摘要 DTO；`since` 统一按 `updatedAt > since`；返回 `serverTime` 供下次作 `since`；`deleted` 预留恒空 | 同步逻辑只需认 `SyncInspection` 与 `serverTime` |
+| P1-7 | 冲突仲裁加**字段白名单** + 版本比对：`cloud_version == 当前 updatedAt` 时接受端侧改动（`winner=device`），否则云端优先 | 冲突上报按白名单传，读 `winner/final/cloudVersion` |
+| P1-9 | 列表接口全部支持 `page/pageSize` + 业务筛选；**不传 page 仍是数组** | 需要分页时传 page，无需改旧解析 |
+| P1-10 | 所有巡检出参新增 `imageAbsoluteUrl`（绝对地址）；`imageUrl` 仍是相对路径 | 跨网加载图片直接用 `imageAbsoluteUrl` |
+| P1-11 | 历史详情与 WS `final` 共用同一 `InspectResp`；额外稳定字段 `taskId/deviceId/deviceName/location/operator/capturedAt/voiceText` | 报告页字段可直接绑定，不用猜 |
+| P1-12 | 新增 `GET /system/media-policy`，统一图片 URL 规则与保留策略（90 天） | 运维/设置页可展示策略 |
+
+### 12.2 生产可运维
+
+| 编号 | 改动 |
+|---|---|
+| P1-8 | **统一错误结构** `{code,message,detail,traceId}`，含中间件 401 / 校验 422 / 未捕获 500；响应头 `X-Trace-Id` 与日志一致 |
+| P2-13 | Trace `events` 标准化为 `{seq,type,timestamp,stepName,payload}`，`seq` 递增可直接回放；新增 `eventCount` |
+| P2-14 | 告警新增 `resolvedBy / resolvedAt / resolveNote`；`resolve` 支持备注，处理人取 token 中的 userId |
+| P2-15 | Token 统计新增 `byUser / byDevice / bySession` 维度；`token_usage` 新增 `userId/deviceId/traceId` 列 |
+
+### 12.3 新增环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PUBLIC_BASE_URL` | 空 | 图片绝对地址基址，如 `http://192.168.1.10:8000`；空则用请求来源 |
+| `MEDIA_RETENTION_DAYS` | 90 | 原图/录音保留天数 |
+| `KEEP_FAILED_UPLOADS` | 0 | 失败上传是否保留媒体文件 |

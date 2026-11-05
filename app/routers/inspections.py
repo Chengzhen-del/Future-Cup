@@ -7,9 +7,11 @@
 """
 import json
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import (APIRouter, File, Form, Header, HTTPException, Request,
+                     UploadFile)
 
 from app.agent.state_machine import run_once
+from app.config import settings
 from app.schemas import InspectReq, InspectResp
 from app.services import store
 
@@ -18,30 +20,23 @@ router = APIRouter(tags=["inspections"])
 MAX_IMAGE_MB = 10
 
 
-def _rebuild_resp(d: dict) -> InspectResp:
-    """幂等命中：把库里已有记录重建成与首次提交相同的 InspectResp。"""
-    return InspectResp(
-        sessionId="",
-        inspectionId=d.get("id", ""),
-        imageUrl=f"/media/{d['imageId']}" if d.get("imageId") else "",
-        level=d.get("level") or "正常",
-        confidence=float(d.get("confidence") or 0.0),
-        advice=d.get("advice") or "",
-        findings=d.get("findings") or [],
-        voiceSlots=d.get("voiceSlots") or {},
-        vision=d.get("vision") or {},
-        steps=d.get("steps") or [],
-        workOrderId=d.get("workOrderId") or None,
-        needHuman=bool(d.get("needHuman")),
-        mock=bool(d.get("mock")),
-        durationMs=int(d.get("durationMs") or 0),
-        duplicate=True,
-    )
+def _base(request: Request) -> str:
+    """P1-10：图片绝对地址基址（优先 PUBLIC_BASE_URL）。"""
+    if settings.PUBLIC_BASE_URL:
+        return settings.PUBLIC_BASE_URL.rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _fill_abs(resp: InspectResp, request: Request) -> InspectResp:
+    if not resp.imageAbsoluteUrl:
+        resp.imageAbsoluteUrl = store.absolute_media_url(resp.imageUrl, _base(request))
+    return resp
 
 
 @router.post("/inspections/upload", response_model=InspectResp,
              summary="上传巡检数据（推荐，multipart 带图）")
-async def upload(image: UploadFile | None = File(None),
+async def upload(request: Request,
+                 image: UploadFile | None = File(None),
                  audio: UploadFile | None = File(None),
                  payload: str = Form("{}"),
                  requestId: str = Form(""),
@@ -56,7 +51,9 @@ async def upload(image: UploadFile | None = File(None),
     if rid:
         existed = store.get_inspection_by_request_id(rid)
         if existed:
-            return _rebuild_resp(existed)
+            resp = store.inspection_to_resp(existed, _base(request))
+            resp.duplicate = True
+            return resp
 
     image_bytes = b""
     if image is not None:
@@ -64,22 +61,29 @@ async def upload(image: UploadFile | None = File(None),
         if len(image_bytes) > MAX_IMAGE_MB * 1024 * 1024:
             raise HTTPException(status_code=413, detail="图片超过 10MB")
     # audio：初赛「录音留证不转写」，此处接收不处理（媒体归档后续补）
-    return await run_once(req, image_bytes, rid)
+    resp = await run_once(req, image_bytes, rid)
+    return _fill_abs(resp, request)
 
 
 @router.post("/inspections", response_model=InspectResp, summary="纯 JSON 上报（无图）")
-async def create(req: InspectReq):
-    return await run_once(req, b"")
+async def create(req: InspectReq, request: Request):
+    return _fill_abs(await run_once(req, b""), request)
 
 
-@router.get("/inspections", summary="巡检记录列表")
-def list_inspections(limit: int = 50):
-    return store.list_inspections(limit)
+@router.get("/inspections", summary="巡检记录列表（同步摘要 DTO，可选分页/筛选）")
+def list_inspections(request: Request, limit: int = 50, page: int | None = None,
+                     pageSize: int = 20, level: str = "", deviceId: str = "",
+                     startTime: str = "", endTime: str = ""):
+    items = store.list_inspections(limit=limit, level=level, device_id=deviceId,
+                                   start_time=startTime, end_time=endTime,
+                                   base_url=_base(request))
+    return store.paginate(items, page, pageSize)
 
 
-@router.get("/inspections/{inspection_id}", summary="巡检详情（含 findings / steps）")
-def get_inspection(inspection_id: str):
+@router.get("/inspections/{inspection_id}", response_model=InspectResp,
+            summary="巡检详情（与 WS final 同一 DTO，含 findings / steps）")
+def get_inspection(inspection_id: str, request: Request):
     d = store.get_inspection(inspection_id)
     if not d:
         raise HTTPException(status_code=404, detail="巡检记录不存在")
-    return d
+    return store.inspection_to_resp(d, _base(request))

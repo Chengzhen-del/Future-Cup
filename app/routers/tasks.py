@@ -30,9 +30,11 @@ def config():
                         serverTime=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
-@router.get("/tasks", response_model=list[TaskItem], summary="巡检任务列表")
-def tasks():
-    return store.list_tasks()
+@router.get("/tasks", summary="巡检任务列表（可选分页/筛选）")
+def tasks(page: int | None = None, pageSize: int = 20,
+          status: str = "", deviceId: str = ""):
+    """不传 page 返回数组（旧客户端兼容）；传 page 返回 {items,total,page,pageSize}。"""
+    return store.paginate(store.list_tasks(status, deviceId), page, pageSize)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskItem, summary="任务详情")
@@ -66,9 +68,9 @@ def device_type_checklist(device_type: str):
                            items=store._default_checklist(device_type))
 
 
-@router.get("/devices", response_model=list[DeviceProfile], summary="设备台账列表")
-def devices():
-    return store.list_devices()
+@router.get("/devices", summary="设备台账列表（可选分页/筛选）")
+def devices(page: int | None = None, pageSize: int = 20, type: str = ""):
+    return store.paginate(store.list_devices(type), page, pageSize)
 
 
 @router.get("/devices/{device_id}", response_model=DeviceProfile, summary="设备档案")
@@ -76,9 +78,10 @@ def device(device_id: str):
     return store.get_device_profile(device_id)
 
 
-@router.get("/workorders", summary="工单列表")
-def workorders():
-    return store.list_workorders()
+@router.get("/workorders", summary="工单列表（可选分页/筛选）")
+def workorders(page: int | None = None, pageSize: int = 20,
+               status: str = "", level: str = "", deviceId: str = ""):
+    return store.paginate(store.list_workorders(status, level, deviceId), page, pageSize)
 
 
 @router.get("/workorders/{wo_id}", summary="工单详情")

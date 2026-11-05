@@ -26,6 +26,7 @@
 | 12 | `alert_logs` | v4 | 生产告警 | LLM 熔断 / RAG 降级 / 工具失败 |
 | 13 | `users` | v4 | 人员档案 | 登录 / 组织维护 |
 | 14 | `token_usage` | v5 | Token 用量与成本 | 每次 LLM 调用 |
+| 15 | `auth_tokens` | v6 | 登录 token（access / refresh） | 登录 / 刷新 / 登出 |
 
 ---
 
@@ -350,3 +351,49 @@ sequenceDiagram
 | 上传（带 requestId） | `inspections.requestId` 落库；重复请求不写 |
 | 任务置进行中 | 同 assignee 其他进行中任务 `status='待巡检'` |
 | 任务置已完成 | `checklistJson` 全部 `done`，回填 `inspectionId` |
+
+---
+
+## 7. v7 迁移（P1 / P2，2026-11）
+
+表数量不变（**15 张**），只加列 + 回填。
+
+### 7.1 新增字段
+
+| 表 | 字段 | 类型 | 说明 |
+|---|---|---|---|
+| `inspections` | `updatedAt` | TEXT | 服务端版本时间，v7 起为**增量同步与冲突仲裁的唯一依据** |
+| `tasks` | `updatedAt` | TEXT | 同上；置进行中/已完成/被顶替时刷新 |
+| `workorders` | `updatedAt` | TEXT | 同上；创建与状态流转时刷新 |
+| `alert_logs` | `resolvedBy` | TEXT | 处理人 `users.id`（取自 token，不由前端传） |
+| `alert_logs` | `resolvedAt` | TEXT | 处理时间 |
+| `alert_logs` | `resolveNote` | TEXT | 处理备注 |
+| `token_usage` | `userId` | TEXT | 由 `sessionId` 反查 `sessions.operator` → `users.id` |
+| `token_usage` | `deviceId` | TEXT | 由 `sessions.deviceId` 反查 |
+| `token_usage` | `traceId` | INTEGER | 关联 `agent_traces.id`，未回填时为 0 |
+
+### 7.2 迁移时自动完成
+
+1. `_ensure_column()` 幂等加列（列已存在不会中断，可重复执行）
+2. 历史数据版本回填：
+   - `inspections.updatedAt = COALESCE(capturedAt, createdAt)`
+   - `tasks.updatedAt = COALESCE(completedAt, startedAt, deadline)`
+   - `workorders.updatedAt = COALESCE(closedAt, createdAt)`
+3. `schema_version` 写入 7
+
+### 7.3 写入时机
+
+| 动作 | 写入 |
+|---|---|
+| 巡检落库 | `inspections.updatedAt = 落库时刻` |
+| 任务状态变更 / 被自动顶替 | `tasks.updatedAt = 变更时刻` |
+| 工单创建 / 流转 | `workorders.updatedAt = 变更时刻` |
+| 冲突仲裁接受端侧改动 | 对应表 `updatedAt` 刷新，返回新版本号 |
+| 告警处理 | `resolved / resolvedBy / resolvedAt / resolveNote` |
+| 每次 LLM 调用 | `token_usage` 追加 `userId / deviceId`（能反查时） |
+
+### 7.4 索引说明
+
+v7 未新增索引。`updatedAt` 上的增量查询走小表全表扫描（≤5000 条上限），
+当前数据量下无需索引；若接入设备数超过 200，建议补
+`CREATE INDEX idx_insp_updated ON inspections(updatedAt)`。

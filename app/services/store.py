@@ -14,7 +14,8 @@ import uuid
 from datetime import datetime, timedelta
 
 from app.config import settings
-from app.schemas import (Finding, InspectReq, InspectResp, TaskItem,
+from app.schemas import (ConflictResp, Finding, InspectReq, InspectResp,
+                         SyncInspection, SyncSnapshot, TaskItem,
                          DeviceProfile, WorkOrder)
 
 # ---- 设备 / 任务 seed ----
@@ -52,6 +53,26 @@ def _conn() -> sqlite3.Connection:
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def paginate(items: list, page: int | None = None, page_size: int = 20):
+    """P1-9 分页：不传 page 返回原列表（旧客户端零改动）；传了返回信封。"""
+    if not page:
+        return items
+    page = max(1, int(page))
+    ps = max(1, min(int(page_size or 20), 200))
+    return {"items": items[(page - 1) * ps: page * ps],
+            "total": len(items), "page": page, "pageSize": ps}
+
+
+def absolute_media_url(path: str, base_url: str = "") -> str:
+    """P1-10：把 /media/xxx 拼成完整可访问地址；已是 http 地址则原样返回。"""
+    if not path:
+        return ""
+    if path.startswith("http"):
+        return path
+    base = (base_url or settings.PUBLIC_BASE_URL or "").rstrip("/")
+    return (base + path) if base else ""
 
 
 def _create_all(c: sqlite3.Connection) -> None:
@@ -364,6 +385,33 @@ def init_db() -> None:
             _seed_users(c)
             _backfill_checklists(c)
 
+        # ---- v7: P1/P2（同步版本号 / 告警处理人 / token 维度） ----
+        if v < 7:
+            _ensure_column(c, "inspections", "updatedAt", "updatedAt TEXT DEFAULT ''")
+            _ensure_column(c, "tasks", "updatedAt", "updatedAt TEXT DEFAULT ''")
+            _ensure_column(c, "workorders", "updatedAt", "updatedAt TEXT DEFAULT ''")
+            _ensure_column(c, "alert_logs", "resolvedBy", "resolvedBy TEXT DEFAULT ''")
+            _ensure_column(c, "alert_logs", "resolvedAt", "resolvedAt TEXT DEFAULT ''")
+            _ensure_column(c, "alert_logs", "resolveNote", "resolveNote TEXT DEFAULT ''")
+            _ensure_column(c, "token_usage", "userId", "userId TEXT DEFAULT ''")
+            _ensure_column(c, "token_usage", "deviceId", "deviceId TEXT DEFAULT ''")
+            _ensure_column(c, "token_usage", "traceId", "traceId INTEGER DEFAULT 0")
+            # 旧数据回填版本时间
+            c.execute("UPDATE inspections SET updatedAt=COALESCE(NULLIF(capturedAt,''),"
+                      "createdAt,'') WHERE updatedAt=''")
+            c.execute("UPDATE tasks SET updatedAt=COALESCE(NULLIF(completedAt,''),"
+                      "NULLIF(startedAt,''),deadline,'') WHERE updatedAt=''")
+            c.execute("UPDATE workorders SET updatedAt=COALESCE(NULLIF(closedAt,''),"
+                      "createdAt,'') WHERE updatedAt=''")
+            c.execute("INSERT INTO schema_version VALUES(7)")
+
+
+def _ensure_column(c: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """幂等加列（迁移可重复执行，不会因列已存在而中断）。"""
+    cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
 
 # ---- P0-3: 登录 / Token（落库，服务重启后仍有效） ----
 def get_user_by_name(name: str) -> dict | None:
@@ -424,16 +472,31 @@ def get_inspection_by_request_id(request_id: str) -> dict | None:
 
 def save_token_usage(model: str, caller: str, prompt_tokens: int,
                      completion_tokens: int, cost_cny: float = 0.0,
-                     session_id: str = "") -> None:
-    """记录一次 LLM 调用的 token 用量（任何失败都静默，不影响主流程）。"""
+                     session_id: str = "", user_id: str = "",
+                     device_id: str = "", trace_id: int = 0) -> None:
+    """记录一次 LLM 调用的 token 用量（任何失败都静默，不影响主流程）。
+
+    P2-15: userId/deviceId 未直接给出时，从 sessions 反查（operator → users.id）。
+    """
     try:
+        if session_id and (not user_id or not device_id):
+            with _conn() as c0:
+                s = c0.execute("SELECT deviceId,operator FROM sessions WHERE id=?",
+                               (session_id,)).fetchone()
+            if s:
+                device_id = device_id or (s["deviceId"] or "")
+                if not user_id and s["operator"]:
+                    with _conn() as c0:
+                        u = c0.execute("SELECT id FROM users WHERE name=?",
+                                       (s["operator"],)).fetchone()
+                    user_id = (u["id"] if u else "") or ""
         with _conn() as c:
             c.execute(
-                "INSERT INTO token_usage(createdAt,model,caller,sessionId,"
-                "promptTokens,completionTokens,totalTokens,costCny) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (_now(), model, caller, session_id, prompt_tokens,
-                 completion_tokens, prompt_tokens + completion_tokens, cost_cny))
+                "INSERT INTO token_usage(createdAt,model,caller,sessionId,userId,deviceId,"
+                "traceId,promptTokens,completionTokens,totalTokens,costCny) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (_now(), model, caller, session_id, user_id, device_id, trace_id,
+                 prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cost_cny))
     except Exception:  # noqa: BLE001
         pass
 
@@ -458,6 +521,18 @@ def get_token_stats(days: int = 7) -> dict:
             "SELECT model, SUM(totalTokens) tokens, SUM(costCny) cost, COUNT(*) calls "
             "FROM token_usage WHERE createdAt>=? GROUP BY model",
             (since,)).fetchall()
+        by_user = c.execute(
+            "SELECT userId, SUM(totalTokens) tokens, SUM(costCny) cost, COUNT(*) calls "
+            "FROM token_usage WHERE createdAt>=? GROUP BY userId ORDER BY tokens DESC",
+            (since,)).fetchall()
+        by_device = c.execute(
+            "SELECT deviceId, SUM(totalTokens) tokens, SUM(costCny) cost, COUNT(*) calls "
+            "FROM token_usage WHERE createdAt>=? GROUP BY deviceId ORDER BY tokens DESC",
+            (since,)).fetchall()
+        by_session = c.execute(
+            "SELECT sessionId, SUM(totalTokens) tokens, SUM(costCny) cost, COUNT(*) calls "
+            "FROM token_usage WHERE createdAt>=? GROUP BY sessionId ORDER BY tokens DESC "
+            "LIMIT 50", (since,)).fetchall()
     return {
         "days": days, "since": since,
         "total": {"promptTokens": total["p"], "completionTokens": total["c"],
@@ -466,6 +541,10 @@ def get_token_stats(days: int = 7) -> dict:
         "byDay": [dict(r) for r in by_day],
         "byCaller": [dict(r) for r in by_caller],
         "byModel": [dict(r) for r in by_model],
+        # P2-15: 生产排障维度
+        "byUser": [dict(r) for r in by_user],
+        "byDevice": [dict(r) for r in by_device],
+        "bySession": [dict(r) for r in by_session],
     }
 
 
@@ -483,6 +562,7 @@ def _task_item(r: sqlite3.Row) -> TaskItem:
     checklist = _load_checklist(d.pop("checklistJson", None))
     if not d.get("inspectionId"):
         d["inspectionId"] = ""
+    d["updatedAt"] = d.get("updatedAt") or ""
     d["checklist"] = checklist
     d["checklistTotal"] = len(checklist)
     d["checklistDone"] = sum(1 for x in checklist if x.get("status") in ("done", "skipped"))
@@ -491,19 +571,24 @@ def _task_item(r: sqlite3.Row) -> TaskItem:
     return TaskItem(**d)
 
 
-def list_tasks() -> list[TaskItem]:
+def list_tasks(status: str = "", device_id: str = "") -> list[TaskItem]:
     with _conn() as c:
         rows = c.execute(
-            "SELECT id,deviceId,title,deviceName,location,status,priority,"
-            "deadline,assignee,inspectionId,checklistJson FROM tasks ORDER BY id").fetchall()
-    return [_task_item(r) for r in rows]
+            "SELECT id,deviceId,title,deviceName,location,status,priority,deadline,"
+            "assignee,inspectionId,checklistJson,updatedAt FROM tasks ORDER BY id").fetchall()
+    items = [_task_item(r) for r in rows]
+    if status:
+        items = [t for t in items if t.status == status]
+    if device_id:
+        items = [t for t in items if t.deviceId == device_id]
+    return items
 
 
 def get_task(task_id: str) -> TaskItem | None:
     with _conn() as c:
         r = c.execute("SELECT id,deviceId,title,deviceName,location,status,priority,"
-                      "deadline,assignee,inspectionId,checklistJson FROM tasks WHERE id=?",
-                      (task_id,)).fetchone()
+                      "deadline,assignee,inspectionId,checklistJson,updatedAt "
+                      "FROM tasks WHERE id=?", (task_id,)).fetchone()
     return _task_item(r) if r else None
 
 
@@ -517,25 +602,30 @@ def update_task_status(task_id: str, status: str, inspection_id: str = "") -> Ta
         checklist = _load_checklist(row["checklistJson"] if row else None)
         if status == "进行中":
             if assignee:
-                c.execute("UPDATE tasks SET status='待巡检' WHERE assignee=? "
-                          "AND status='进行中' AND id<>?", (assignee, task_id))
-            c.execute("UPDATE tasks SET status=?, startedAt=? WHERE id=?",
-                      (status, now, task_id))
+                c.execute("UPDATE tasks SET status='待巡检', updatedAt=? WHERE assignee=? "
+                          "AND status='进行中' AND id<>?", (now, assignee, task_id))
+            c.execute("UPDATE tasks SET status=?, startedAt=?, updatedAt=? WHERE id=?",
+                      (status, now, now, task_id))
         elif status == "已完成":
             for item in checklist:
                 item["status"] = "done"
             c.execute("UPDATE tasks SET status=?, completedAt=?, inspectionId=?, "
-                      "checklistJson=? WHERE id=?",
+                      "checklistJson=?, updatedAt=? WHERE id=?",
                       (status, now, inspection_id,
-                       json.dumps(checklist, ensure_ascii=False), task_id))
+                       json.dumps(checklist, ensure_ascii=False), now, task_id))
         else:
-            c.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+            c.execute("UPDATE tasks SET status=?, updatedAt=? WHERE id=?",
+                      (status, now, task_id))
     return get_task(task_id)
 
 
-def list_devices() -> list[DeviceProfile]:
+def list_devices(device_type: str = "") -> list[DeviceProfile]:
     with _conn() as c:
-        rows = c.execute("SELECT * FROM devices ORDER BY id").fetchall()
+        if device_type:
+            rows = c.execute("SELECT * FROM devices WHERE type=? ORDER BY id",
+                             (device_type,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM devices ORDER BY id").fetchall()
     return [DeviceProfile(**dict(r)) for r in rows]
 
 
@@ -548,11 +638,81 @@ def get_device_profile(device_id: str) -> DeviceProfile:
 
 
 # ---- 查询：巡检 ----
-def list_inspections(limit: int = 50) -> list[dict]:
+def _inspection_brief(d: dict, base_url: str = "") -> SyncInspection:
+    """P1-6：同步/列表共用的固定摘要结构（不含 findings / steps）。"""
+    image = f"/media/{d['imageId']}" if d.get("imageId") else ""
+    return SyncInspection(
+        inspectionId=d.get("id") or "",
+        taskId=d.get("taskId") or "",
+        deviceId=d.get("deviceId") or "",
+        deviceName=d.get("deviceName") or "",
+        location=d.get("location") or "",
+        operator=d.get("operator") or "",
+        level=d.get("level") or "正常",
+        confidence=float(d.get("confidence") or 0.0),
+        advice=d.get("advice") or "",
+        imageUrl=image,
+        imageAbsoluteUrl=absolute_media_url(image, base_url),
+        workOrderId=d.get("workOrderId") or "",
+        capturedAt=d.get("capturedAt") or "",
+        createdAt=d.get("createdAt") or "",
+        updatedAt=d.get("updatedAt") or "",
+        needHuman=bool(d.get("needHuman")),
+        mock=bool(d.get("mock")),
+    )
+
+
+def inspection_to_resp(d: dict, base_url: str = "") -> InspectResp:
+    """P1-11：历史详情与 WS final 用同一个 InspectResp DTO。"""
+    image = f"/media/{d['imageId']}" if d.get("imageId") else ""
+    return InspectResp(
+        sessionId=d.get("sessionId") or "",
+        inspectionId=d.get("id") or "",
+        imageUrl=image,
+        imageAbsoluteUrl=absolute_media_url(image, base_url),
+        level=d.get("level") or "正常",
+        confidence=float(d.get("confidence") or 0.0),
+        advice=d.get("advice") or "",
+        findings=d.get("findings") or [],
+        voiceSlots=d.get("voiceSlots") or {},
+        vision=d.get("vision") or {},
+        steps=d.get("steps") or [],
+        workOrderId=d.get("workOrderId") or None,
+        needHuman=bool(d.get("needHuman")),
+        mock=bool(d.get("mock")),
+        durationMs=int(d.get("durationMs") or 0),
+        taskId=d.get("taskId") or "",
+        deviceId=d.get("deviceId") or "",
+        deviceName=d.get("deviceName") or "",
+        location=d.get("location") or "",
+        operator=d.get("operator") or "",
+        capturedAt=d.get("capturedAt") or "",
+        voiceText=d.get("voiceText") or "",
+    )
+
+
+def list_inspections(limit: int = 50, level: str = "", device_id: str = "",
+                     start_time: str = "", end_time: str = "",
+                     base_url: str = "") -> list[SyncInspection]:
+    sql = "SELECT * FROM inspections WHERE 1=1"
+    args: list = []
+    if level:
+        sql += " AND level=?"
+        args.append(level)
+    if device_id:
+        sql += " AND deviceId=?"
+        args.append(device_id)
+    if start_time:
+        sql += " AND COALESCE(NULLIF(capturedAt,''),createdAt)>=?"
+        args.append(start_time)
+    if end_time:
+        sql += " AND COALESCE(NULLIF(capturedAt,''),createdAt)<=?"
+        args.append(end_time)
+    sql += " ORDER BY createdAt DESC LIMIT ?"
+    args.append(limit)
     with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM inspections ORDER BY createdAt DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(r) for r in rows]
+        rows = c.execute(sql, args).fetchall()
+    return [_inspection_brief(dict(r), base_url) for r in rows]
 
 
 def get_inspection(inspection_id: str) -> dict | None:
@@ -584,22 +744,36 @@ def _load_json(s: str | None):
 def create_workorder(task_id: str, device_id: str, device_name: str,
                      level: str, description: str,
                      inspection_id: str = "") -> WorkOrder:
+    now = _now()
     wo = WorkOrder(id="WO-" + uuid.uuid4().hex[:6].upper(), inspectionId=inspection_id,
                    taskId=task_id, deviceId=device_id, deviceName=device_name,
-                   level=level, description=description, status="待处理", createdAt=_now())
+                   level=level, description=description, status="待处理",
+                   createdAt=now, updatedAt=now)
     with _conn() as c:
         c.execute("INSERT INTO workorders(id,inspectionId,taskId,deviceId,deviceName,"
-                  "level,description,assignee,status,handleNote,createdAt,closedAt) "
-                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "level,description,assignee,status,handleNote,createdAt,closedAt,updatedAt) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (wo.id, wo.inspectionId, wo.taskId, wo.deviceId, wo.deviceName,
                    wo.level, wo.description, wo.assignee, wo.status, wo.handleNote,
-                   wo.createdAt, wo.closedAt))
+                   wo.createdAt, wo.closedAt, wo.updatedAt))
     return wo
 
 
-def list_workorders() -> list[WorkOrder]:
+def list_workorders(status: str = "", level: str = "", device_id: str = "") -> list[WorkOrder]:
+    sql = "SELECT * FROM workorders WHERE 1=1"
+    args: list = []
+    if status:
+        sql += " AND status=?"
+        args.append(status)
+    if level:
+        sql += " AND level=?"
+        args.append(level)
+    if device_id:
+        sql += " AND deviceId=?"
+        args.append(device_id)
+    sql += " ORDER BY createdAt DESC"
     with _conn() as c:
-        rows = c.execute("SELECT * FROM workorders ORDER BY createdAt DESC").fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [WorkOrder(**dict(r)) for r in rows]
 
 
@@ -610,10 +784,11 @@ def get_workorder(wo_id: str) -> WorkOrder | None:
 
 
 def update_workorder_status(wo_id: str, status: str, handle_note: str = "") -> WorkOrder | None:
-    closed_at = _now() if status == "已闭环" else ""
+    now = _now()
+    closed_at = now if status == "已闭环" else ""
     with _conn() as c:
-        c.execute("UPDATE workorders SET status=?, handleNote=?, closedAt=? WHERE id=?",
-                  (status, handle_note, closed_at, wo_id))
+        c.execute("UPDATE workorders SET status=?, handleNote=?, closedAt=?, updatedAt=? "
+                  "WHERE id=?", (status, handle_note, closed_at, now, wo_id))
     return get_workorder(wo_id)
 
 
@@ -623,6 +798,7 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
                         request_id: str = "") -> InspectResp:
     """把一次巡检写进 inspections/findings/media，并回填 inspectionId/imageUrl。"""
     iid = f"IN-{datetime.now():%Y%m%d}-{uuid.uuid4().hex[:4]}"
+    now = _now()
     image_file = ""
     if image_bytes:
         image_file = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}.jpg"
@@ -638,8 +814,9 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
         c.execute(
             "INSERT INTO inspections(id,taskId,deviceId,deviceName,location,operator,"
             "voiceText,voiceSlotsJson,visionJson,sensorJson,imageId,level,confidence,"
-            "advice,needHuman,mock,stepsJson,workOrderId,durationMs,capturedAt,createdAt,requestId) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "advice,needHuman,mock,stepsJson,workOrderId,durationMs,capturedAt,createdAt,"
+            "requestId,updatedAt) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (iid, req.taskId, req.deviceId, req.deviceName, req.location, req.operator,
              req.voiceText, resp.voiceSlots.model_dump_json(),
              resp.vision.model_dump_json(), sensor_json,
@@ -647,7 +824,7 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
              resp.level, resp.confidence, resp.advice,
              1 if resp.needHuman else 0, 1 if resp.mock else 0,
              json.dumps([s.model_dump() for s in resp.steps], ensure_ascii=False),
-             resp.workOrderId, resp.durationMs, req.capturedAt, _now(), request_id))
+             resp.workOrderId, resp.durationMs, req.capturedAt, now, request_id, now))
         for i, f in enumerate(resp.findings):
             c.execute("INSERT INTO findings(inspectionId,item,value,abnormal,basis,sortOrder) "
                       "VALUES(?,?,?,?,?,?)",
@@ -655,7 +832,99 @@ def finalize_inspection(req: InspectReq, resp: InspectResp,
 
     resp.inspectionId = iid
     resp.imageUrl = f"/media/{image_file}" if image_file else ""
+    # 配了 PUBLIC_BASE_URL 时 WS final 也能直接拿到完整地址；否则由路由层按请求来源补
+    resp.imageAbsoluteUrl = absolute_media_url(resp.imageUrl)
     return resp
+
+# ============= P1-6/7: 端侧同步快照 + 冲突仲裁 =============
+# 增量与版本统一用 updatedAt（服务端维护），不再混用 capturedAt / createdAt。
+CONFLICT_ALLOWED: dict[str, set[str]] = {
+    "inspections": {"level", "confidence", "advice", "needHuman"},
+    "workorders": {"status", "handleNote", "assignee"},
+    "tasks": {"status", "inspectionId"},
+}
+
+
+def get_sync_snapshot(device_id: str = "", since: str = "", base_url: str = "") -> SyncSnapshot:
+    """端侧启动全量（不带 since）/ 之后增量（带 since）；since 比较 updatedAt。"""
+    TASK_COLS = ("SELECT id,deviceId,title,deviceName,location,status,priority,deadline,"
+                 "assignee,inspectionId,checklistJson,updatedAt FROM tasks ")
+    dev = " AND deviceId=?" if device_id else ""
+    dev_args: tuple = (device_id,) if device_id else ()
+    with _conn() as c:
+        if since:
+            irows = c.execute("SELECT * FROM inspections WHERE updatedAt > ?" + dev
+                              + " ORDER BY updatedAt ASC LIMIT 5000",
+                              (since,) + dev_args).fetchall()
+            wrows = c.execute("SELECT * FROM workorders WHERE updatedAt > ?" + dev
+                              + " ORDER BY updatedAt ASC LIMIT 5000",
+                              (since,) + dev_args).fetchall()
+            trows = c.execute(TASK_COLS + "WHERE updatedAt > ?" + dev
+                              + " ORDER BY updatedAt ASC", (since,) + dev_args).fetchall()
+        else:
+            irows = c.execute("SELECT * FROM inspections WHERE 1=1" + dev
+                              + " ORDER BY updatedAt DESC LIMIT 5000", dev_args).fetchall()
+            wrows = c.execute("SELECT * FROM workorders WHERE 1=1" + dev
+                              + " ORDER BY updatedAt DESC LIMIT 5000", dev_args).fetchall()
+            trows = c.execute(TASK_COLS + "WHERE 1=1" + dev + " ORDER BY id",
+                              dev_args).fetchall()
+    return SyncSnapshot(
+        since=since,
+        sinceField="updatedAt",
+        serverTime=_now(),
+        devices=list_devices(),
+        tasks=[_task_item(r) for r in trows],
+        workorders=[WorkOrder(**dict(r)) for r in wrows],
+        inspections=[_inspection_brief(dict(r), base_url) for r in irows],
+        deleted=[],
+    )
+
+
+def resolve_conflict(table: str, rec_id: str, cloud_version: str,
+                     device_changes: dict) -> ConflictResp:
+    """冲突仲裁规则（白名单 + 版本比对）：
+
+    - 只接受白名单字段；
+    - 若端侧记录的 cloud_version 与服务端当前 updatedAt 一致，说明云端没被别人改过，
+      接受端侧改动（winner=device）；
+    - 否则云端记录已变更，以云端为准（winner=cloud）。
+    """
+    allowed = CONFLICT_ALLOWED.get(table, set())
+    changes = dict(device_changes or {})
+    applied = [k for k in changes if k in allowed]
+    rejected = [k for k in changes if k not in allowed]
+
+    def _final() -> dict | None:
+        with _conn() as c:
+            r = c.execute(f"SELECT * FROM {table} WHERE id=?", (rec_id,)).fetchone()
+        return dict(r) if r else None
+
+    cur = _final()
+    if not cur:
+        return ConflictResp(table=table, id=rec_id, resolved=False, winner="cloud",
+                            applied=[], rejected=rejected, final={},
+                            message="云端不存在该记录，请以云端列表为准")
+
+    current_version = cur.get("updatedAt") or cur.get("createdAt") or ""
+    if applied and cloud_version and cloud_version == current_version:
+        now = _now()
+        sets, args = [], []
+        for k in applied:
+            v = changes[k]
+            sets.append(f"{k}=?")
+            args.append(int(bool(v)) if k == "needHuman" else v)
+        sets.append("updatedAt=?")
+        args.append(now)
+        with _conn() as c:
+            c.execute(f"UPDATE {table} SET {','.join(sets)} WHERE id=?", (*args, rec_id))
+        return ConflictResp(table=table, id=rec_id, resolved=True, winner="device",
+                            cloudVersion=now, applied=applied, rejected=rejected,
+                            final=_final() or {}, message="云端版本未变，已接受端侧改动")
+
+    return ConflictResp(table=table, id=rec_id, resolved=True, winner="cloud",
+                        cloudVersion=current_version, applied=[], rejected=rejected,
+                        final=cur, message="云端记录已变更，以云端为准")
+
 
 # ============= 会话记忆 / 历史巡检记忆 =============
 
@@ -734,6 +1003,7 @@ def save_trace(session_id: str, events: list[dict], resp: "InspectResp",
                 clean[k] = v.model_dump()
             else:
                 clean[k] = v
+        clean.setdefault("timestamp", now)   # P2-13: 事件时间（同一轮内精度到秒，顺序看 seq）
         events_serializable.append(clean)
     with _conn() as c:
         c.execute(
@@ -745,8 +1015,45 @@ def save_trace(session_id: str, events: list[dict], resp: "InspectResp",
              _json.dumps(events_serializable, ensure_ascii=False), now))
 
 
+def _normalize_events(events: list, fallback_ts: str = "") -> list[dict]:
+    """P2-13：把历史/新产生的异构事件统一成 {seq,type,timestamp,stepName,payload}。"""
+    out = []
+    for i, ev in enumerate(events or []):
+        if not isinstance(ev, dict):
+            out.append({"seq": i + 1, "type": "raw", "timestamp": fallback_ts,
+                        "stepName": "", "payload": {"value": str(ev)}})
+            continue
+        typ = ev.get("type") or "unknown"
+        step = ev.get("step") if isinstance(ev.get("step"), dict) else None
+        if ev.get("data") is not None:
+            payload = ev["data"]
+        elif ev.get("payload") is not None:
+            payload = ev["payload"]
+        elif ev.get("subStep") is not None:
+            payload = ev["subStep"]
+        elif step is not None:
+            payload = step
+        elif ev.get("memories") is not None:
+            payload = {"memories": ev["memories"]}
+        elif ev.get("text") is not None:
+            payload = {"text": ev["text"]}
+        else:
+            payload = {k: v for k, v in ev.items()
+                       if k not in ("type", "timestamp", "ts", "stepName")}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        out.append({
+            "seq": i + 1,
+            "type": typ,
+            "timestamp": ev.get("timestamp") or ev.get("ts") or fallback_ts,
+            "stepName": ev.get("stepName") or (step or {}).get("name", "") or "",
+            "payload": payload,
+        })
+    return out
+
+
 def get_trace(trace_id: int) -> dict | None:
-    """单条 Trace 查询（/api/v1/traces/{id}）。"""
+    """单条 Trace 查询（/api/v1/traces/{id}），事件已标准化、按 seq 可直接回放。"""
     with _conn() as c:
         row = c.execute(
             "SELECT * FROM agent_traces WHERE id=?", (trace_id,)).fetchone()
@@ -754,22 +1061,34 @@ def get_trace(trace_id: int) -> dict | None:
         return None
     import json as _json
     d = dict(row)
-    d["events"] = _json.loads(d.pop("eventsJson") or "[]")
+    raw = _json.loads(d.pop("eventsJson") or "[]")
+    d["events"] = _normalize_events(raw, d.get("createdAt") or "")
+    d["eventCount"] = len(d["events"])
     return d
 
 
-def list_traces(device_id: str | None = None, limit: int = 20) -> list[dict]:
+def list_traces(device_id: str | None = None, limit: int = 20, level: str = "",
+                start_time: str = "", end_time: str = "") -> list[dict]:
     """最近的 Trace 列表（不含 events 大字段，轻量）。"""
+    sql = ("SELECT id,sessionId,inspectionId,deviceId,deviceName,level,confidence,"
+           "durationMs,createdAt FROM agent_traces WHERE 1=1")
+    args: list = []
+    if device_id:
+        sql += " AND deviceId=?"
+        args.append(device_id)
+    if level:
+        sql += " AND level=?"
+        args.append(level)
+    if start_time:
+        sql += " AND createdAt>=?"
+        args.append(start_time)
+    if end_time:
+        sql += " AND createdAt<=?"
+        args.append(end_time)
+    sql += " ORDER BY createdAt DESC LIMIT ?"
+    args.append(limit)
     with _conn() as c:
-        if device_id:
-            rows = c.execute(
-                "SELECT id,sessionId,inspectionId,deviceId,deviceName,level,confidence,durationMs,createdAt "
-                "FROM agent_traces WHERE deviceId=? ORDER BY createdAt DESC LIMIT ?",
-                (device_id, limit)).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT id,sessionId,inspectionId,deviceId,deviceName,level,confidence,durationMs,createdAt "
-                "FROM agent_traces ORDER BY createdAt DESC LIMIT ?", (limit,)).fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -826,24 +1145,44 @@ def log_alert(level: str, category: str, message: str, detail: str = "") -> None
             (level, category, message, detail[:500], now))
 
 
-def list_alerts(unresolved_only: bool = True, limit: int = 50) -> list[dict]:
+def list_alerts(unresolved_only: bool = True, limit: int = 50, level: str = "",
+                category: str = "", start_time: str = "", end_time: str = "") -> list[dict]:
     """告警列表（/api/v1/alerts）。"""
+    sql = "SELECT * FROM alert_logs WHERE 1=1"
+    args: list = []
+    if unresolved_only:
+        sql += " AND resolved=0"
+    if level:
+        sql += " AND level=?"
+        args.append(level)
+    if category:
+        sql += " AND category=?"
+        args.append(category)
+    if start_time:
+        sql += " AND createdAt>=?"
+        args.append(start_time)
+    if end_time:
+        sql += " AND createdAt<=?"
+        args.append(end_time)
+    sql += " ORDER BY createdAt DESC LIMIT ?"
+    args.append(limit)
     with _conn() as c:
-        if unresolved_only:
-            rows = c.execute(
-                "SELECT * FROM alert_logs WHERE resolved=0 ORDER BY createdAt DESC LIMIT ?",
-                (limit,)).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT * FROM alert_logs ORDER BY createdAt DESC LIMIT ?", (limit,)).fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
 
 
-def resolve_alert(alert_id: int) -> bool:
-    """标记告警为已处理。"""
+def resolve_alert(alert_id: int, note: str = "", user_id: str = "") -> dict | None:
+    """P2-14：标记已处理并记录处理人/时间/备注；返回最新告警。"""
     now = _now()
     with _conn() as c:
-        return c.execute("UPDATE alert_logs SET resolved=1 WHERE id=?", (alert_id,)).rowcount > 0
+        ok = c.execute("UPDATE alert_logs SET resolved=1, resolvedBy=?, resolvedAt=?, "
+                       "resolveNote=? WHERE id=?", (user_id, now, note, alert_id)).rowcount > 0
+        if not ok:
+            return None
+        r = c.execute("SELECT * FROM alert_logs WHERE id=?", (alert_id,)).fetchone()
+    d = dict(r)
+    d["resolved"] = bool(d.get("resolved"))
+    return d
 
 
 # ---- 内部：日期工具 ----

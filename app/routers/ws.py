@@ -19,6 +19,14 @@ router = APIRouter(tags=["agent"])
 log = logging.getLogger("inspectagent.ws")
 
 
+def _media_base(ws: WebSocket) -> str:
+    """P1-10：WS 里图片绝对地址的基址（ws:// -> http://）。"""
+    if settings.PUBLIC_BASE_URL:
+        return settings.PUBLIC_BASE_URL.rstrip("/")
+    return (str(ws.base_url).rstrip("/")
+            .replace("ws://", "http://").replace("wss://", "https://"))
+
+
 @router.websocket("/ws/agent/{session_id}")
 async def agent_ws(ws: WebSocket, session_id: str):
     await ws.accept()
@@ -54,12 +62,33 @@ async def agent_ws(ws: WebSocket, session_id: str):
                 operator=body.get("operator", ""),
                 capturedAt=body.get("capturedAt", ""),
                 sensor=body.get("sensor"),
+                mode=body.get("mode", "quick"),
+                clarifications=body.get("clarifications"),
             )
             img_b64 = body.get("imageBase64", "")
             image_bytes = base64.b64decode(img_b64) if img_b64 else b""
+            rid = (body.get("requestId") or "").strip()
 
-            agent = InspectAgent(req, image_bytes)
+            # 幂等：同一 requestId 重复连 WS 时直接回放已有结果
+            if rid:
+                existed = store.get_inspection_by_request_id(rid)
+                if existed:
+                    data = store.inspection_to_resp(existed, _media_base(ws)).model_dump()
+                    data["duplicate"] = True
+                    data["imageAbsoluteUrl"] = store.absolute_media_url(
+                        data.get("imageUrl", ""), _media_base(ws))
+                    await ws.send_json({"type": "final", "data": data})
+                    await ws.send_json({"type": "end"})
+                    continue
+
+            agent = InspectAgent(req, image_bytes, rid)
             async for ev in agent.run():
+                # P1-10：WS final 也带完整图片地址
+                if ev.get("type") == "final":
+                    d = ev.setdefault("data", {})
+                    if not d.get("imageAbsoluteUrl"):
+                        d["imageAbsoluteUrl"] = store.absolute_media_url(
+                            d.get("imageUrl", ""), _media_base(ws))
                 await ws.send_json(ev)
             await ws.send_json({"type": "end"})
     except WebSocketDisconnect:

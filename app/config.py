@@ -52,6 +52,12 @@ class Settings:
     ACCESS_TOKEN_TTL_MIN: int = int(os.getenv("ACCESS_TOKEN_TTL_MIN", "120"))
     REFRESH_TOKEN_TTL_DAYS: int = int(os.getenv("REFRESH_TOKEN_TTL_DAYS", "7"))
 
+    # ---- 媒体与对外地址（P1-10 / P1-12）----
+    # 留空则用请求来源拼绝对地址；跨网/反代时建议显式配置，例 http://192.168.1.10:8000
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+    MEDIA_RETENTION_DAYS: int = int(os.getenv("MEDIA_RETENTION_DAYS", "90"))
+    KEEP_FAILED_UPLOADS: bool = os.getenv("KEEP_FAILED_UPLOADS", "0").lower() in ("1", "true")
+
     # ---- Token 计费（元 / 百万 tokens，DeepSeek 官方价，可按需改） ----
     LLM_PRICE_INPUT_PER_M: float = float(os.getenv("LLM_PRICE_INPUT_PER_M", "2.0"))
     LLM_PRICE_OUTPUT_PER_M: float = float(os.getenv("LLM_PRICE_OUTPUT_PER_M", "8.0"))
